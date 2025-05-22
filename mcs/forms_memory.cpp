@@ -1,15 +1,14 @@
 // forms_memory.cpp
 #include "main.h"    // Crucial: Includes the Forms class declaration
-#include <iostream>  // For std::cerr debugging (optional)
-#include <cstring>   // For std::memcpy (though not ideal for bool**)
+#include <iostream>
+#include <cstring>   // For std::memcpy in some deep copy scenarios (though not ideal for bool**)
 
 // --- Private Helper Methods Implementation ---
 void Forms::clear_Vars_Glob() {
-    if (Vars_Glob != nullptr) { // Check before dereferencing/deleting
+    if (Vars_Glob != nullptr) {
         for (int i = 0; i < NVars_Glob; ++i) {
-            if (Vars_Glob[i] != nullptr) { // Check inner pointers too
+            if (Vars_Glob[i] != nullptr) {
                 delete[] Vars_Glob[i];
-                // Vars_Glob[i] = nullptr; // Good practice, though not strictly needed before outer delete
             }
         }
         delete[] Vars_Glob;
@@ -29,7 +28,7 @@ void Forms::clear_forms1Glob() {
         forms1Glob = nullptr;
     }
     Nform1_Glob = 0;
-    // form1Size is a parameter
+    // form1Size is a parameter, not cleared here
 }
 
 void Forms::clear_reducedVars_Glob() {
@@ -50,9 +49,7 @@ void Forms::clear_VarsDescr_Glob() {
         delete[] VarsDescr_Glob;
         VarsDescr_Glob = nullptr;
     }
-    // NVars_Glob is the count, reset when Vars_Glob is cleared
 }
-
 
 void Forms::clear_all_memory() {
     clear_Vars_Glob();
@@ -60,57 +57,46 @@ void Forms::clear_all_memory() {
     clear_reducedVars_Glob();
     clear_VarsDescr_Glob();
 
-    // Placeholder for other dynamic members if they are added and managed by Forms
     if (NForms_pos_Glob) { delete[] NForms_pos_Glob; NForms_pos_Glob = nullptr; }
     if (SeqPos) { delete[] SeqPos; SeqPos = nullptr; }
     if (forms1_pos_Glob) {
-        // This is int***, needs careful nested deletion based on its structure
-        // Example: if forms1_pos_Glob[i] is an array of int**
-        // for (int i = 0; i < some_count_for_forms1_pos_Glob; ++i) {
-        //     if (forms1_pos_Glob[i]) {
-        //         for (int j = 0; j < NForms_pos_Glob[i] (hypothetical); ++j) {
-        //             delete[] forms1_pos_Glob[i][j];
-        //         }
-        //         delete[] forms1_pos_Glob[i];
-        //     }
-        // }
-        // delete[] forms1_pos_Glob;
-        // forms1_pos_Glob = nullptr;
-        // For now, since its allocation is not defined, just nulling:
-        forms1_pos_Glob = nullptr; // Needs proper deallocation if used
+        // Proper deallocation for int*** forms1_pos_Glob depends on its allocation structure.
+        // Assuming it's not deeply used or managed elsewhere for now.
+        // If it were Forms*** forms1_pos_Glob[outer][inner_count_from_NForms_pos_Glob]
+        // then a nested loop deleting Forms objects then the arrays of pointers.
+        // For now, just to prevent a trivial leak if it were simply new int**:
+        // delete[] forms1_pos_Glob; // This is wrong if it's int*** and not just int**
+        forms1_pos_Glob = nullptr; // Placeholder - requires actual deallocation logic if used
     }
 }
 
 void Forms::deep_copy_members(const Forms& other) {
-    // Copy parameters first, as they might be needed for allocations
     N_glob = other.N_glob;
     N_2_glob = other.N_2_glob;
     Nsovp1_Glob = other.Nsovp1_Glob;
-    form1Size = other.form1Size; // Crucial for forms1Glob allocation size
+    form1Size = other.form1Size;
 
-    // Deep copy Vars_Glob
-    NVars_Glob = other.NVars_Glob; // Copy count first
-    if (other.Vars_Glob != nullptr && NVars_Glob > 0 && N_glob > 0) {
+    NVars_Glob = other.NVars_Glob;
+    if (other.Vars_Glob != nullptr && NVars_Glob > 0 && other.N_glob > 0) { // Use other.N_glob for source dimension
         Vars_Glob = new bool* [NVars_Glob];
         for (int i = 0; i < NVars_Glob; ++i) {
-            Vars_Glob[i] = new bool[N_glob];
-            for (int j = 0; j < N_glob; ++j) {
+            Vars_Glob[i] = new bool[other.N_glob]; // Allocate with other.N_glob
+            for (int j = 0; j < other.N_glob; ++j) {
                 Vars_Glob[i][j] = other.Vars_Glob[i][j];
             }
         }
     }
     else {
         Vars_Glob = nullptr;
-        NVars_Glob = 0; // Ensure count is 0 if pointer is null
+        NVars_Glob = 0;
     }
 
-    // Deep copy forms1Glob
-    Nform1_Glob = other.Nform1_Glob; // Copy count first
-    if (other.forms1Glob != nullptr && Nform1_Glob > 0 && form1Size > 0) {
+    Nform1_Glob = other.Nform1_Glob;
+    if (other.forms1Glob != nullptr && Nform1_Glob > 0 && other.form1Size > 0) { // Use other.form1Size
         forms1Glob = new int* [Nform1_Glob];
         for (int i = 0; i < Nform1_Glob; ++i) {
-            forms1Glob[i] = new int[form1Size]; // Use copied form1Size
-            for (int j = 0; j < form1Size; ++j) {
+            forms1Glob[i] = new int[other.form1Size]; // Allocate with other.form1Size
+            for (int j = 0; j < other.form1Size; ++j) {
                 forms1Glob[i][j] = other.forms1Glob[i][j];
             }
         }
@@ -120,13 +106,18 @@ void Forms::deep_copy_members(const Forms& other) {
         Nform1_Glob = 0;
     }
 
-    // Deep copy reducedVars_Glob
-    NReducedVars_Glob = other.NReducedVars_Glob; // Copy count first
-    if (other.reducedVars_Glob != nullptr && NReducedVars_Glob > 0 && N_glob > 0) {
+    NReducedVars_Glob = other.NReducedVars_Glob;
+    // N_glob for reducedVars_Glob should be consistent with other.N_glob if source was Vars_Glob,
+    // or specific N_glob of other if reducedVars_Glob had different length patterns.
+    // Assuming reduced patterns have same length as original N_glob from 'other' if 'other' holds them.
+    int reduced_pattern_length = other.N_glob; // Or a specific N for reducedVars if different
+    // If 'other' itself has reducedVars, use other.N_glob related to its reducedVars
+
+    if (other.reducedVars_Glob != nullptr && NReducedVars_Glob > 0 && reduced_pattern_length > 0) {
         reducedVars_Glob = new bool* [NReducedVars_Glob];
         for (int i = 0; i < NReducedVars_Glob; ++i) {
-            reducedVars_Glob[i] = new bool[N_glob];
-            for (int j = 0; j < N_glob; ++j) {
+            reducedVars_Glob[i] = new bool[reduced_pattern_length];
+            for (int j = 0; j < reduced_pattern_length; ++j) {
                 reducedVars_Glob[i][j] = other.reducedVars_Glob[i][j];
             }
         }
@@ -136,7 +127,6 @@ void Forms::deep_copy_members(const Forms& other) {
         NReducedVars_Glob = 0;
     }
 
-    // Deep copy VarsDescr_Glob
     if (other.VarsDescr_Glob != nullptr && NVars_Glob > 0) { // Assuming size matches NVars_Glob
         VarsDescr_Glob = new int[NVars_Glob];
         for (int i = 0; i < NVars_Glob; ++i) {
@@ -147,49 +137,39 @@ void Forms::deep_copy_members(const Forms& other) {
         VarsDescr_Glob = nullptr;
     }
 
-    // Initialize other pointers to nullptr, their deep copy would be more complex
-    // and depends on how NForms_pos_Glob (if it's a count array) is structured.
-    NForms_pos_Glob = nullptr;
+    NForms_pos_Glob = nullptr; // Deep copy not implemented for these complex members
     forms1_pos_Glob = nullptr;
     SeqPos = nullptr;
 }
 
-
-// --- Public Constructors / Destructor / Assignment Operator Implementation ---
 Forms::Forms() :
     N_glob(0), N_2_glob(0), Nsovp1_Glob(0),
     NVars_Glob(0), Vars_Glob(nullptr),
     Nform1_Glob(0), form1Size(0), forms1Glob(nullptr),
     NReducedVars_Glob(0), reducedVars_Glob(nullptr),
     VarsDescr_Glob(nullptr),
-    NForms_pos_Glob(nullptr), forms1_pos_Glob(nullptr), SeqPos(nullptr) // Initialize new members
-{
-    // std::cout << "Forms Default Constructor: All members initialized." << std::endl;
+    NForms_pos_Glob(nullptr), forms1_pos_Glob(nullptr), SeqPos(nullptr) {
 }
 
 Forms::~Forms() {
-    // std::cout << "Forms Destructor: Clearing all memory." << std::endl;
     clear_all_memory();
 }
 
-Forms::Forms(const Forms& other) : // Copy Constructor
-    // Initialize all members to default before copying, crucial for RAII if deep_copy_members throws
-    N_glob(0), N_2_glob(0), Nsovp1_Glob(0),
+Forms::Forms(const Forms& other) :
+    N_glob(0), N_2_glob(0), Nsovp1_Glob(0), // Initialize primitives
     NVars_Glob(0), Vars_Glob(nullptr),
     Nform1_Glob(0), form1Size(0), forms1Glob(nullptr),
     NReducedVars_Glob(0), reducedVars_Glob(nullptr),
     VarsDescr_Glob(nullptr),
     NForms_pos_Glob(nullptr), forms1_pos_Glob(nullptr), SeqPos(nullptr)
 {
-    // std::cout << "Forms Copy Constructor: Deep copying from other." << std::endl;
     deep_copy_members(other);
 }
 
-Forms& Forms::operator=(const Forms& other) { // Assignment Operator
-    // std::cout << "Forms Assignment Operator: Handling assignment." << std::endl;
-    if (this != &other) {       // Self-assignment check
-        clear_all_memory();      // Clear existing resources in 'this' object
-        deep_copy_members(other); // Copy resources from 'other' to 'this'
+Forms& Forms::operator=(const Forms& other) {
+    if (this != &other) {
+        clear_all_memory();
+        deep_copy_members(other);
     }
     return *this;
 }

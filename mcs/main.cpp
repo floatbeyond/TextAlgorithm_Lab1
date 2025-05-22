@@ -1,5 +1,6 @@
-#include "main.h"           // For Forms class, FilterMapCollection
-#include "make_positions.h" // For build_filter_map function
+// main.cpp
+#include "main.h"           
+#include "make_positions.h" 
 
 #include <iostream>
 #include <fstream>
@@ -7,298 +8,396 @@
 #include <vector>
 #include <set>
 #include <map>
-#include <cstdlib>      // For std::rand(), std::srand()
-#include <ctime>        // For std::time()
-#include <iomanip>      // For std::fixed, std::setprecision, std::setw
-#include <cmath>        // For std::ceil, std::pow, std::round
-#include <algorithm>    // For std::min, std::max
-#include <chrono>       // For timing
-#include <random>       // For std::mt19937, std::uniform_int_distribution
+#include <cstdlib>      
+#include <ctime>        
+#include <iomanip>      
+#include <cmath>        
+#include <algorithm>    
+#include <chrono>       
+#include <random>       
 
-// --- Global Parameters (based on X=8, adjust if X changes) ---
-const int X_PARAM = 8; // Last digit of ID (example)
-const int N_PARAM_VAL = 25 - static_cast<int>(std::round(static_cast<double>(X_PARAM) / 2.0)); // W, Query Word Size (21 for X=8)
-const double MATCH_SIMILARITY_THRESHOLD = (60.0 + X_PARAM) / 100.0; // (0.68 for X=8)
-const int K_PARAM_VAL = static_cast<int>(std::ceil(N_PARAM_VAL * MATCH_SIMILARITY_THRESHOLD)); // K, ones in base patterns (15 for X=8, W=21, T=0.68)
-const std::vector<int> M_VALUES_PARAM = { 3, 4, 5 }; // m values
+// --- Global Parameters (based on X=8) ---
+const int X_PARAM = 8;
+const int N_PARAM_VAL = 25 - static_cast<int>(std::round(static_cast<double>(X_PARAM) / 2.0));
+const double MATCH_SIMILARITY_THRESHOLD = (60.0 + X_PARAM) / 100.0;
+const int K_PARAM_VAL = static_cast<int>(std::ceil(N_PARAM_VAL * MATCH_SIMILARITY_THRESHOLD));
+const std::vector<int> M_VALUES_PARAM = { 3, 4, 5 };
 
-const long long TEXT_SIZE_PARAM = 10000000; // 10M
-// const long long TEXT_SIZE_PARAM = 100000; // 100K for testing
+const long long TEXT_SIZE_PARAM = 10000000;
 const int NUM_QUERIES_PARAM = 10000;
-int ALPHABET_SIZE_Y_PARAM = 4; // Default, will be determined
+int ALPHABET_SIZE_Y_PARAM = 4; // Default, will be determined or overridden
 
-// For random choices in positional refinement
-std::mt19937 global_rng_engine(static_cast<unsigned int>(std::time(0)));
+std::mt19937 global_rng_engine; // Declare global, seed in main
 
 
 // --- Utility Functions ---
-double calculate_similarity(const std::string& s1, const std::string& s2) {
-    if (s1.length() != s2.length() || s1.empty()) {
-        return 0.0;
-    }
-    int matches = 0;
-    for (size_t i = 0; i < s1.length(); ++i) {
-        if (s1[i] == s2[i]) {
-            matches++;
-        }
-    }
-    return static_cast<double>(matches) / s1.length();
-}
-
-// Helper function to calculate binomial coefficient C(n,k)
-double nCr_prob(int n, int r) {
+double nCr_prob_util(int n, int r) { // Renamed to avoid conflict if Forms has one
     if (r < 0 || r > n) return 0.0;
     if (r == 0 || r == n) return 1.0;
     if (r > n / 2) r = n - r;
     double res = 1.0;
-    for (int i = 1; i <= r; ++i) {
-        res = res * (n - i + 1) / i;
-    }
+    for (int i = 1; i <= r; ++i) res = res * (n - i + 1) / i;
     return res;
 }
 
-// Probability of exactly k matches in W trials, prob_char_match for one char
-double binomial_pmf(int W_len, int k_successes, double prob_char_match) {
+double binomial_pmf_util(int W_len, int k_successes, double prob_char_match) {
     if (k_successes < 0 || k_successes > W_len) return 0.0;
-    return nCr_prob(W_len, k_successes) * std::pow(prob_char_match, k_successes) * std::pow(1.0 - prob_char_match, W_len - k_successes);
+    if (prob_char_match == 0.0) return (k_successes == 0) ? 1.0 : 0.0;
+    if (prob_char_match == 1.0) return (k_successes == W_len) ? 1.0 : 0.0;
+
+    // Use logs for stability if numbers are extreme, direct for typical cases
+    double log_nCr = std::log(nCr_prob_util(W_len, k_successes));
+    double log_p_k = k_successes * std::log(prob_char_match);
+    double log_1_minus_p_nk = (W_len - k_successes) * std::log(1.0 - prob_char_match);
+
+    if (std::isinf(log_nCr) || std::isinf(log_p_k) || std::isinf(log_1_minus_p_nk)) { // check for -inf
+        if (log_nCr == -std::numeric_limits<double>::infinity() && k_successes > 0 && k_successes < W_len) return 0; // C(n,k) was 0
+        // other underflow/overflow checks might be needed if direct method is used
+    }
+    try {
+        return std::exp(log_nCr + log_p_k + log_1_minus_p_nk);
+    }
+    catch (const std::overflow_error& e) {
+        // Fallback to direct if exp overflows, though logs should help prevent this
+        return nCr_prob_util(W_len, k_successes) * std::pow(prob_char_match, k_successes) * std::pow(1.0 - prob_char_match, W_len - k_successes);
+    }
 }
 
 void determine_alphabet_size_Y() {
     std::cout << "Determining appropriate alphabet size Y for W=" << N_PARAM_VAL << ", K_matches_needed=" << K_PARAM_VAL << "..." << std::endl;
-    for (int Y_test = 8; Y_test <= 26; ++Y_test) {
+    bool found_y = false;
+    for (int Y_test = 2; Y_test <= 26; ++Y_test) { // Changed from 12 to 2, as per original prompt idea
         double prob_single_char_match = 1.0 / Y_test;
         double prob_at_least_K_matches = 0.0;
         for (int k = K_PARAM_VAL; k <= N_PARAM_VAL; ++k) {
-            prob_at_least_K_matches += binomial_pmf(N_PARAM_VAL, k, prob_single_char_match);
+            prob_at_least_K_matches += binomial_pmf_util(N_PARAM_VAL, k, prob_single_char_match);
         }
-
         double expected_random_hits_in_text = (TEXT_SIZE_PARAM - N_PARAM_VAL + 1) * prob_at_least_K_matches;
-
         std::cout << "  Y = " << std::setw(2) << Y_test
             << ": P(single char match) = " << std::fixed << std::setprecision(4) << prob_single_char_match
-            << ", P(>=K matches in W) = " << std::scientific << prob_at_least_K_matches
+            << ", P(>=K matches in W) = " << std::scientific << std::setprecision(4) << prob_at_least_K_matches
             << ", Expected random query hits in " << TEXT_SIZE_PARAM << " text: " << std::fixed << std::setprecision(2) << expected_random_hits_in_text
             << std::endl;
-
-        if (expected_random_hits_in_text >= 2.0 && expected_random_hits_in_text <= 20.0) { // Aim for a small number
+        if (!found_y && expected_random_hits_in_text >= 2.0 && expected_random_hits_in_text <= 20.0) {
             ALPHABET_SIZE_Y_PARAM = Y_test;
-            std::cout << "  Selected Y = " << ALPHABET_SIZE_Y_PARAM << std::endl;
-            return;
+            std::cout << "  Selected Y = " << ALPHABET_SIZE_Y_PARAM << " (based on 2-20 expected hits criteria)" << std::endl;
+            found_y = true; // Take the first one in range
         }
     }
-    std::cout << "  Could not find Y for 2-20 expected hits. Defaulting to Y = " << ALPHABET_SIZE_Y_PARAM << std::endl;
+    if (!found_y) {
+        std::cout << "  Could not find Y for 2-20 expected hits in range 2-26. Using hardcoded Y." << std::endl;
+        ALPHABET_SIZE_Y_PARAM = 12; // Fallback to user's test value if criteria not met
+        std::cout << "  Using fallback Y = " << ALPHABET_SIZE_Y_PARAM << std::endl;
+    }
 }
 
-std::string generate_random_text(long long length, int alphabet_size) {
+std::string generate_random_text(long long length, int alphabet_size, const std::string& output_filename, std::mt19937& rng_engine_ref) {
     std::cout << "Generating random text of length " << length << " with alphabet size " << alphabet_size << "..." << std::endl;
     std::string text;
+    if (length <= 0) { std::cout << "Text length 0, no text generated." << std::endl; return text; }
     text.reserve(length);
     std::uniform_int_distribution<> distrib(0, alphabet_size - 1);
     for (long long i = 0; i < length; ++i) {
-        text += static_cast<char>('a' + distrib(global_rng_engine));
+        text += static_cast<char>('a' + distrib(rng_engine_ref));
     }
-    std::cout << "Random text generated." << std::endl;
-
+    std::cout << "Random text generation complete." << std::endl;
+    if (!output_filename.empty()) {
+        std::ofstream outfile(output_filename);
+        if (outfile.is_open()) {
+            outfile << text; outfile.close();
+            std::cout << "  Generated text saved to " << output_filename << std::endl;
+        }
+        else {
+            std::cerr << "  ERROR: Could not open " << output_filename << " to save text." << std::endl;
+        }
+    }
     return text;
 }
 
 std::vector<std::string> extract_queries(const std::string& text, int num_queries, int query_length) {
     std::cout << "Extracting " << num_queries << " queries of length " << query_length << "..." << std::endl;
     std::vector<std::string> queries;
+    if (query_length <= 0) { std::cerr << "Query length 0, no queries extracted." << std::endl; return queries; }
     queries.reserve(num_queries);
     for (int i = 0; i < num_queries; ++i) {
         if (static_cast<long long>(i) * query_length + query_length > text.length()) {
             std::cerr << "Warning: Not enough text to extract all " << num_queries << " non-overlapping queries." << std::endl;
             break;
         }
-        queries.push_back(text.substr(static_cast<long long>(i) * query_length, query_length));
+        queries.push_back(text.substr(static_cast<size_t>(i) * query_length, query_length)); // Use size_t for substr
     }
     std::cout << queries.size() << " queries extracted." << std::endl;
     return queries;
 }
 
-// --- Search Algorithm Implementations ---
-
-// Naive Search
-std::set<int> search_naive(const std::string& query, const std::string& text) {
-    std::set<int> match_positions;
-    int query_len = query.length();
-    if (query_len == 0 || text.length() < query_len) return match_positions;
-
-    for (long long i = 0; i <= static_cast<long long>(text.length()) - query_len; ++i) {
-        std::string text_segment = text.substr(i, query_len);
-        if (calculate_similarity(query, text_segment) >= MATCH_SIMILARITY_THRESHOLD) {
-            match_positions.insert(static_cast<int>(i));
-        }
+// Place this utility function somewhere accessible in main.cpp or a utility section
+void save_match_positions(const std::string& filename,
+    const std::string& query_id, // Or the query string itself
+    const std::set<int>& match_positions) {
+    std::ofstream outfile(filename, std::ios_base::app); // Open in append mode
+    if (!outfile.is_open()) {
+        std::cerr << "  ERROR: Could not open file " << filename << " to save match positions." << std::endl;
+        return;
     }
-    return match_positions;
+    // outfile << "Query: " << query_id << "\tMatches (" << match_positions.size() << "):\t"; // Old more verbose
+    outfile << query_id << "\t" << match_positions.size(); // Query ID and count
+    for (int pos : match_positions) {
+        outfile << "\t" << pos; // Tab-separated positions
+    }
+    outfile << std::endl;
+    // No need to close explicitly here if only appending one line, destructor will close.
+    // But if appending many times in a loop, periodic close/reopen or flush might be good.
+    // For this use case (once per query), it's fine.
 }
 
-// Helper to apply filter from Forms representation
-std::string apply_forms_filter_to_string(const std::string& str_to_filter, const int* filter_bits, int filter_span, int N_glob_param) {
+double calculate_similarity(const std::string& s1, const std::string& s2) {
+    if (s1.length() != s2.length() || s1.empty()) return 0.0;
+    int matches = 0;
+    for (size_t i = 0; i < s1.length(); ++i) if (s1[i] == s2[i]) matches++;
+    return static_cast<double>(matches) / s1.length();
+}
+
+std::string apply_forms_filter_to_string(const std::string& str_to_filter, const int* filter_bits, int filter_span, int N_glob_param_filter_storage_length) {
     std::string masked_str = "";
-    if (filter_span <= 0 || str_to_filter.length() < static_cast<size_t>(filter_span)) {
-        // Cannot apply: filter is longer than string or invalid span
-        // Return empty or some indicator, or handle upstream
+    if (filter_span <= 0 || str_to_filter.length() < static_cast<size_t>(filter_span) || filter_span > N_glob_param_filter_storage_length) {
         return "INVALID_FILTER_APPLICATION";
     }
     masked_str.reserve(filter_span);
     for (int k = 0; k < filter_span; ++k) {
-        if (filter_bits[k] == 1) {
-            masked_str += str_to_filter[k];
-        }
-        else {
-            masked_str += '_';
-        }
+        masked_str += (filter_bits[k] == 1 ? str_to_filter[k] : '_');
     }
     return masked_str;
 }
 
+// --- Search Algorithm Implementations ---
+// Performs a naive, brute-force search for a query in a text.
+// Slides a window of size W across the text and calculates similarity at each position.
+std::set<int> search_naive(const std::string& query,         // The query string to search for
+    const std::string& text,          // The text to search within
+    int W,                           // The expected length of the query (and text segments)
+    double threshold)                 // The similarity threshold for a match
+{
+    std::set<int> match_positions; // Stores starting positions of confirmed matches
 
-// Usual MCS Search
-std::set<int> search_usual_mcs(const std::string& query, const Forms& mcs_object,
-    const FilterMapCollection& filter_map, const std::string& text) {
-    std::set<int> match_positions;
-    if (query.length() != N_PARAM_VAL) return match_positions; // Query length must match W
+    // Basic validation: query length must match W, and text must be long enough.
+    if (W == 0 || query.length() != static_cast<size_t>(W) || text.length() < static_cast<size_t>(W)) {
+        // std::cerr << "Warning (search_naive): Invalid parameters or query/text length." << std::endl;
+        return match_positions; // Return empty set if params are invalid
+    }
 
+    // Iterate through all possible starting positions for a segment of length W in the text.
+    // The loop condition ensures that `text.substr(i, W)` is always valid.
+    for (long long i = 0; i <= static_cast<long long>(text.length()) - W; ++i) {
+        // Extract the current text segment of length W.
+        std::string text_segment = text.substr(i, W);
+
+        // Calculate the similarity between the query and the current text segment.
+        if (calculate_similarity(query, text_segment) >= threshold) {
+            // If similarity meets or exceeds the threshold, it's a match.
+            match_positions.insert(static_cast<int>(i)); // Store the starting position of the match.
+        }
+    }
+    return match_positions; // Return the set of all found match positions.
+}
+
+// --- MCS Search Algorithm ---
+// Performs a search using the "Usual" MCS (Multiple Correlated Substrings) approach.
+// It uses a precomputed filter map to quickly identify candidate positions,
+// then verifies these candidates using full similarity calculation.
+std::set<int> search_usual_mcs(const std::string& query,         // The query string
+    const Forms& mcs_object,        // Forms object containing the MCS_0 filters
+    const FilterMapCollection& filter_map, // Precomputed map of masked text segments
+    const std::string& text,          // The text to search within
+    int W,                           // Expected query/window length
+    double threshold)                 // Similarity threshold for a match
+{
+    std::set<int> match_positions; // Stores starting positions of confirmed matches
+
+    // Validate query length against W (N_PARAM_VAL).
+    if (query.length() != static_cast<size_t>(W)) {
+        // std::cerr << "Warning (search_usual_mcs): Query length mismatch." << std::endl;
+        return match_positions;
+    }
+
+    // --- STAGE 1: Candidate Identification using Filters and Filter Map ---
+    // Iterate through each filter in the provided MCS set (e.g., MCS_0).
     for (int i = 0; i < mcs_object.Nform1_Glob; ++i) {
-        const int* current_filter_bits = mcs_object.forms1Glob[i];
-        int filter_span = mcs_object.forms1Glob[i][mcs_object.N_glob]; // Actual span
+        const int* current_filter_bits = mcs_object.forms1Glob[i];         // Get the bits of the current filter.
+        int filter_span = mcs_object.forms1Glob[i][mcs_object.N_glob]; // Get the actual span/length of this filter.
+        // mcs_object.N_glob is the max length for which filter arrays are allocated.
 
-        if (filter_span <= 0 || filter_span > N_PARAM_VAL) continue;
+        // Validate filter span: must be positive and not exceed query length W.
+        if (filter_span <= 0 || filter_span > W) {
+            continue; // Skip invalid or inapplicable filter
+        }
 
+        // Apply the current filter to the query string to get a "masked query".
+        // 'apply_forms_filter_to_string' uses '_' for masked-out positions.
+        // mcs_object.N_glob is passed as the filter storage length for apply_forms_filter_to_string.
         std::string masked_query = apply_forms_filter_to_string(query, current_filter_bits, filter_span, mcs_object.N_glob);
-        if (masked_query == "INVALID_FILTER_APPLICATION") continue;
 
+        if (masked_query == "INVALID_FILTER_APPLICATION") { // Check if filter application failed
+            continue;
+        }
 
+        // Look up this masked_query in the precomputed filter_map.
+        // The filter_map contains all unique masked segments found in the 'text' (generated by 'build_filter_map').
         auto it = filter_map.word_to_index_map.find(masked_query);
+
         if (it != filter_map.word_to_index_map.end()) {
+            // If the masked_query exists in the map, 'it->second' is the index into 'entries_vector'.
+            // 'occurrences' is a list of all starting positions in 'text' where this masked pattern was found.
             const std::vector<int>& occurrences = filter_map.entries_vector[it->second].occurrences;
+
+            // --- STAGE 2: Candidate Verification ---
+            // For each candidate position found via the map...
             for (int text_pos : occurrences) {
-                if (static_cast<long long>(text_pos) + N_PARAM_VAL > text.length()) continue;
-                std::string text_segment = text.substr(text_pos, N_PARAM_VAL);
-                if (calculate_similarity(query, text_segment) >= MATCH_SIMILARITY_THRESHOLD) {
-                    match_positions.insert(text_pos);
+                // Bounds check: ensure the full segment of length W can be extracted from text.
+                if (static_cast<long long>(text_pos) + W > text.length()) {
+                    continue;
+                }
+
+                // Extract the original, unmasked text segment from the candidate position.
+                std::string text_segment = text.substr(text_pos, W);
+
+                // Perform a full similarity check between the original query and the original text segment.
+                if (calculate_similarity(query, text_segment) >= threshold) {
+                    match_positions.insert(text_pos); // Confirmed match.
                 }
             }
         }
     }
-    return match_positions;
+    return match_positions; // Return set of confirmed match positions.
 }
 
-// Positional Associated MCS Search
-std::set<int> search_positional_mcs(const std::string& query,
-    const std::vector<Forms>& positional_mcs_sequence, // Sequence of MCS_0, MCS_1, ...
-    const FilterMapCollection& filter_map, // Map built from MCS_0
-    const std::string& text) {
-    std::set<int> aggregated_match_positions;
-    if (query.length() != N_PARAM_VAL) return aggregated_match_positions;
+// --- Positional MCS Search Algorithm ---
+// Performs a search using the "Positional-Associated" MCS approach.
+// It iterates through a sequence of MCS sets (MCS_0, MCS_1, ..., MCS_p).
+// For each filter in each MCS set, it applies the filter to the query,
+// looks up the masked query in a filter map (typically built from MCS_0),
+// and then verifies candidate positions. Matches from all sets are aggregated.
+std::set<int> search_positional_mcs(const std::string& query,                     // The query string
+    const std::vector<Forms>& positional_mcs_sequence, // Sequence of MCS sets
+    const FilterMapCollection& map_from_mcs0,       // Filter map, usually built from MCS_0
+    const std::string& text,                      // The text to search within
+    int W,                                       // Expected query/window length
+    double threshold)                             // Similarity threshold
+{
+    std::set<int> aggregated_match_positions; // Stores unique match positions from all MCS sets
 
-    // The PDF implies using MCS_i for a conceptual "position i" in processing.
-    // Since our query and filters are fixed length W, we can iterate through the
-    // generated MCS sets and apply each one, aggregating unique matches.
-    // A more complex interpretation would be needed if queries were much longer than filters.
-    int mcs_set_idx = 0;
+    // Validate query length.
+    if (query.length() != static_cast<size_t>(W)) {
+        // std::cerr << "Warning (search_positional_mcs): Query length mismatch." << std::endl;
+        return aggregated_match_positions;
+    }
+
+    // Iterate through each MCS set in the positional sequence (MCS_0, MCS_1, etc.).
     for (const Forms& mcs_set : positional_mcs_sequence) {
-        // std::cout << "    Searching with Positional MCS_" << mcs_set_idx++ << " (num filters: " << mcs_set.Nform1_Glob << ")" << std::endl;
+        // --- STAGE 1 (per MCS set): Candidate Identification ---
+        // For each filter within the current mcs_set...
         for (int i = 0; i < mcs_set.Nform1_Glob; ++i) {
             const int* current_filter_bits = mcs_set.forms1Glob[i];
-            int filter_span = mcs_set.forms1Glob[i][mcs_set.N_glob];
+            int filter_span = mcs_set.forms1Glob[i][mcs_set.N_glob]; // N_glob of this mcs_set
 
-            if (filter_span <= 0 || filter_span > N_PARAM_VAL) continue;
+            // Validate filter span against query length W.
+            if (filter_span <= 0 || filter_span > W) {
+                continue;
+            }
 
+            // Apply the current filter to the query string.
+            // mcs_set.N_glob is passed as the filter storage length.
             std::string masked_query = apply_forms_filter_to_string(query, current_filter_bits, filter_span, mcs_set.N_glob);
-            if (masked_query == "INVALID_FILTER_APPLICATION") continue;
 
+            if (masked_query == "INVALID_FILTER_APPLICATION") {
+                continue;
+            }
 
-            auto it = filter_map.word_to_index_map.find(masked_query);
-            if (it != filter_map.word_to_index_map.end()) {
-                const std::vector<int>& occurrences = filter_map.entries_vector[it->second].occurrences;
+            // Look up the masked_query in the filter map (which was typically built from MCS_0).
+            // The assumption is that filters in subsequent positional sets (MCS_1, MCS_2...)
+            // are still meaningful when their masked versions are looked up in MCS_0's map.
+            auto it = map_from_mcs0.word_to_index_map.find(masked_query);
+
+            if (it != map_from_mcs0.word_to_index_map.end()) {
+                const std::vector<int>& occurrences = map_from_mcs0.entries_vector[it->second].occurrences;
+
+                // --- STAGE 2 (per MCS set): Candidate Verification ---
                 for (int text_pos : occurrences) {
-                    if (static_cast<long long>(text_pos) + N_PARAM_VAL > text.length()) continue;
-                    std::string text_segment = text.substr(text_pos, N_PARAM_VAL);
-                    if (calculate_similarity(query, text_segment) >= MATCH_SIMILARITY_THRESHOLD) {
-                        aggregated_match_positions.insert(text_pos);
+                    // Bounds check.
+                    if (static_cast<long long>(text_pos) + W > text.length()) {
+                        continue;
+                    }
+
+                    // Extract original text segment and verify against original query.
+                    std::string text_segment = text.substr(text_pos, W);
+                    if (calculate_similarity(query, text_segment) >= threshold) {
+                        aggregated_match_positions.insert(text_pos); // Add to set (handles uniqueness).
                     }
                 }
             }
         }
     }
-    return aggregated_match_positions;
+    return aggregated_match_positions; // Return all unique matches found across all positional MCS sets.
 }
-
 
 // --- Main Orchestration ---
 int main() {
-    std::srand(static_cast<unsigned int>(std::time(0))); // Seed for std::rand() if used by Forms
-    // global_rng_engine is already seeded
+    unsigned int seed = static_cast<unsigned int>(std::time(0));
+    global_rng_engine.seed(seed);
+    std::srand(seed);
+
+    std::cout << std::fixed << std::setprecision(4); // Default precision for cout
 
     std::cout << "--- MCS Algorithm Comparison ---" << std::endl;
-    std::cout << "Parameters: W=" << N_PARAM_VAL << " (Query/Window Size)" << std::endl;
-    std::cout << "            K=" << K_PARAM_VAL << " (Min 1s in Base Patterns C(N,K))" << std::endl;
-    std::cout << "            Match Threshold=" << MATCH_SIMILARITY_THRESHOLD * 100 << "%" << std::endl;
-    std::cout << "            M values (1s in Filters): {" << M_VALUES_PARAM[0] << ", "
+    std::cout << "Parameters: W(N_PARAM_VAL)=" << N_PARAM_VAL
+        << ", K(K_PARAM_VAL)=" << K_PARAM_VAL
+        << ", Match Threshold=" << MATCH_SIMILARITY_THRESHOLD * 100 << "%" << std::endl;
+    std::cout << "            M values: {" << M_VALUES_PARAM[0] << ", "
         << M_VALUES_PARAM[1] << ", " << M_VALUES_PARAM[2] << "}" << std::endl;
 
-    // Step 1: Determine Alphabet Size Y
-    // determine_alphabet_size_Y();
-	ALPHABET_SIZE_Y_PARAM = 12; // For now, hardcoded for testing
-    std::cout << "Using Alphabet Size Y = " << ALPHABET_SIZE_Y_PARAM << std::endl;
+    determine_alphabet_size_Y(); // Sets ALPHABET_SIZE_Y_PARAM
+	// ALPHABET_SIZE_Y_PARAM = 6; // Hardcoded for testing purposes
+    std::cout << "Using final Alphabet Size Y = " << ALPHABET_SIZE_Y_PARAM << std::endl;
 
-    // Step 2: Generate Text and Queries
-    std::string main_text = generate_random_text(TEXT_SIZE_PARAM, ALPHABET_SIZE_Y_PARAM);
+    std::string main_text_file = "main_text_Y" + std::to_string(ALPHABET_SIZE_Y_PARAM) + ".txt";
+    std::string main_text = generate_random_text(TEXT_SIZE_PARAM, ALPHABET_SIZE_Y_PARAM, main_text_file, global_rng_engine);
+    if (main_text.empty() && TEXT_SIZE_PARAM > 0) {
+        std::cerr << "FATAL: Main text generation failed. Exiting." << std::endl; return 1;
+    }
     std::vector<std::string> queries = extract_queries(main_text, NUM_QUERIES_PARAM, N_PARAM_VAL);
+    if (queries.empty() && NUM_QUERIES_PARAM > 0) {
+        std::cerr << "FATAL: Query extraction failed. Exiting." << std::endl; return 1;
+    }
 
-    // --- Generate Full Basic Patterns (Vars_Glob) ONCE ---
+
     Forms f_global_pattern_holder;
     f_global_pattern_holder.N_glob = N_PARAM_VAL;
-    f_global_pattern_holder.N_2_glob = K_PARAM_VAL; // K (ones in base patterns)
-    // form1Size will be set internally by methods needing it, or when filters are made
-
+    f_global_pattern_holder.N_2_glob = K_PARAM_VAL;
     std::cout << "\nGenerating full basic patterns (Vars_Glob for C(N,K)) ONCE..." << std::endl;
     auto timer_start_base_patterns = std::chrono::high_resolution_clock::now();
-    f_global_pattern_holder.create_mas1(); // Creates "tavnits.txt" and populates Vars_Glob
+    f_global_pattern_holder.create_mas1();
     auto timer_end_base_patterns = std::chrono::high_resolution_clock::now();
     auto duration_base_patterns = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_base_patterns - timer_start_base_patterns);
-    if (f_global_pattern_holder.NVars_Glob == 0) {
-        std::cerr << "FATAL: No basic patterns generated by create_mas1. Exiting." << std::endl;
-        return 1;
+    if (f_global_pattern_holder.NVars_Glob == 0 && K_PARAM_VAL > 0) { // If K=0, NVars_Glob can be 0 (e.g. pattern "000...")
+        std::cerr << "FATAL: No basic patterns generated by create_mas1. Exiting." << std::endl; return 1;
     }
     std::cout << "  Full basic patterns (tavnits.txt) generated: " << f_global_pattern_holder.NVars_Glob
         << " (Time: " << duration_base_patterns.count() << " ms)" << std::endl;
 
-    // --- Storage for results for comparison ---
-    std::map<std::string, std::chrono::milliseconds> total_times;
-    std::map<std::string, int> total_matches_found;
+    std::map<std::string, std::chrono::milliseconds> total_times_preprocess;
+    std::map<std::string, std::chrono::milliseconds> total_times_search;
+    std::map<std::string, long long> total_matches_found;
 
-	// --- Storage for results of each algorithm ---
-    std::map<std::string, std::vector<std::set<int>>> all_algorithm_results;
 
-    // --- Loop for each M value ---
     for (int m_val : M_VALUES_PARAM) {
         std::string m_str = "M" + std::to_string(m_val);
-        std::cout << "\n=====================================================" << std::endl;
-        std::cout << "Processing for " << m_str << " (N=" << N_PARAM_VAL << ", K=" << K_PARAM_VAL << ")" << std::endl;
-        std::cout << "=====================================================" << std::endl;
+        std::cout << "\n================ PROCESSING FOR " << m_str << " ================" << std::endl;
 
-        // --- A. "Usual" MCS (MCS_0 for this M) ---
+        // A. "Usual" MCS (MCS_0)
         std::cout << "\nPART A: 'Usual' MCS (MCS_0 for " << m_str << ")" << std::endl;
-        Forms mcs_0_object; // Default constructor initializes members
+        Forms mcs_0_object;
         mcs_0_object.N_glob = N_PARAM_VAL;
-        mcs_0_object.N_2_glob = K_PARAM_VAL; // K used for Vars_Glob from which filters are derived
-        mcs_0_object.Nsovp1_Glob = m_val;    // M (ones in filter)
-        // mcs_0_object.form1Size will be N_PARAM_VAL + 1, set by chetv_struct or when allocating forms1Glob
-
-        // Share the global Vars_Glob (read-only for chetv_struct_Generation)
-        // This requires Forms to handle being assigned a Vars_Glob pointer without owning it,
-        // OR to make a deep copy if true isolation is needed.
-        // For now, let's assume chetv_struct_Generation uses the Vars_Glob already in mcs_0_object
-        // (which should be populated by copying from f_global_pattern_holder)
-        // This is safer: mcs_0_object gets its own copy of relevant params from f_global_pattern_holder
-        //mcs_0_object.Vars_Glob = f_global_pattern_holder.Vars_Glob; // Share pointer
-        //mcs_0_object.NVars_Glob = f_global_pattern_holder.NVars_Glob;
-
-
+        mcs_0_object.N_2_glob = K_PARAM_VAL;
+        mcs_0_object.Nsovp1_Glob = m_val;
 
         std::string initial_forms_filename = "Usual_MCS_InitialForms_" + m_str + ".txt";
         std::cout << "  1. Generating MCS_0 filters (chetv_struct_Generation)..." << std::endl;
@@ -309,21 +408,29 @@ int main() {
         std::cout << "     Initial filters for " << m_str << ": " << mcs_0_object.Nform1_Glob
             << " (Time: " << duration_mcs0_gen.count() << " ms)" << std::endl;
 
-        if (mcs_0_object.Nform1_Glob == 0) {
-            std::cerr << "     WARNING: No MCS_0 filters generated for " << m_str << ". Skipping further steps for this M." << std::endl;
-            continue;
+        bool run_global_refinement = true; // Set to true to run Forms1_anal1
+        if (run_global_refinement && mcs_0_object.Nform1_Glob > 0) {
+            std::cout << "  (Optional) Globally refining MCS_0 for " << m_str << "..." << std::endl;
+            std::string refined_mcs0_filename = "Usual_MCS_RefinedForms_" + m_str + ".txt";
+            auto timer_start_mcs0_refine = std::chrono::high_resolution_clock::now();
+            mcs_0_object.Forms1_anal1_Global_Refinement(initial_forms_filename, f_global_pattern_holder, refined_mcs0_filename);
+            auto timer_end_mcs0_refine = std::chrono::high_resolution_clock::now();
+            duration_mcs0_gen += std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_mcs0_refine - timer_start_mcs0_refine); // Add to gen time
+            std::cout << "     MCS_0 for " << m_str << " refined. Final count: " << mcs_0_object.Nform1_Glob
+                << " (Refinement Time: " << (timer_end_mcs0_refine - timer_start_mcs0_refine).count() << " ms)" << std::endl;
+        }
+        else if (mcs_0_object.Nform1_Glob == 0) {
+            std::cout << "     Skipping global refinement as MCS_0 is empty for " << m_str << "." << std::endl;
         }
 
-        // Optional: Global refinement of MCS_0 using Forms1_anal1_Global_Refinement
-        std::string refined_mcs0_filename = "Usual_MCS_RefinedForms_" + m_str + ".txt";
-        mcs_0_object.Forms1_anal1_Global_Refinement(
-            initial_forms_filename,      // File to READ from (as per prof's code)
-            f_global_pattern_holder,     // Source of base patterns
-            refined_mcs0_filename        // File to WRITE refined filters to
-        );
 
-        std::string mcs0_saved_filename_prefix = "Usual_MCS_" + m_str;
-        mcs_0_object.save_forms_to_file(mcs0_saved_filename_prefix + "_Filters.txt", "Usual MCS_0");
+        if (mcs_0_object.Nform1_Glob == 0) {
+            std::cerr << "     WARNING: No MCS_0 filters for " << m_str << ". Skipping further steps for this M." << std::endl;
+            continue;
+        }
+        // save_forms_to_file is called inside Forms1_anal1_Global_Refinement if run, or by chetv_struct if not.
+        // If neither saves with final name, add a save here:
+        // mcs_0_object.save_forms_to_file("Usual_MCS_Final_" + m_str + ".txt", "Final Usual MCS_0");
 
 
         std::cout << "  2. Building Filter Map for MCS_0 (" << m_str << ")..." << std::endl;
@@ -334,54 +441,78 @@ int main() {
         auto timer_end_map_build = std::chrono::high_resolution_clock::now();
         auto duration_map_build = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_map_build - timer_start_map_build);
         std::cout << "     Filter Map for " << m_str << " built. (Time: " << duration_map_build.count() << " ms)" << std::endl;
+        total_times_preprocess["Usual_MCS_" + m_str] = duration_base_patterns + duration_mcs0_gen + duration_map_build;
+
 
         std::cout << "  3. Searching with Usual MCS (" << m_str << ")..." << std::endl;
-        std::string usual_mcs_algo_name = "Usual_MCS_M" + std::to_string(m_val);
-        all_algorithm_results[usual_mcs_algo_name].resize(queries.size()); // Pre-allocate space
-        long long current_total_matches = 0;
+        long long current_usual_mcs_matches_count_total = 0; // Renamed
+        std::string usual_mcs_matches_filename = "usual_mcs_matches_" + m_str + ".txt";
+        // Clear file and write header
+        std::ofstream usual_outfile(usual_mcs_matches_filename, std::ios_base::trunc);
+        if (usual_outfile.is_open()) {
+            usual_outfile << "QueryID\tNumMatches\tMatchPosition_1\tMatchPosition_2\t..." << std::endl;
+            usual_outfile.close();
+        }
+        else {
+            std::cerr << "ERROR: Could not open " << usual_mcs_matches_filename << " to write header for M=" << m_val << std::endl;
+        }
 
         auto timer_start_usual_search = std::chrono::high_resolution_clock::now();
-        for (size_t q_idx = 0; q_idx < queries.size(); ++q_idx) {
-            all_algorithm_results[usual_mcs_algo_name][q_idx] =
-                search_usual_mcs(queries[q_idx], mcs_0_object, usual_mcs_filter_map, main_text);
-            current_total_matches += all_algorithm_results[usual_mcs_algo_name][q_idx].size();
+        int query_idx_usual = 0;
+        const int total_queries_for_usual = queries.size();
+        const int usual_progress_interval = std::max(1, total_queries_for_usual / 100);
+        for (const auto& q_str : queries) {
+            std::set<int> current_query_matches = search_usual_mcs(q_str, mcs_0_object, usual_mcs_filter_map, main_text, N_PARAM_VAL, MATCH_SIMILARITY_THRESHOLD);
+            current_usual_mcs_matches_count_total += current_query_matches.size();
+
+            save_match_positions(usual_mcs_matches_filename, "Query_" + std::to_string(query_idx_usual), current_query_matches);
+            query_idx_usual++;
+            // Progress indicator block for Usual MCS
+            if (query_idx_usual % usual_progress_interval == 0 || query_idx_usual == total_queries_for_usual) {
+                auto current_time_usual = std::chrono::high_resolution_clock::now();
+                auto elapsed_ms_usual = std::chrono::duration_cast<std::chrono::milliseconds>(current_time_usual - timer_start_usual_search).count();
+                double percent_done = (static_cast<double>(query_idx_usual) / total_queries_for_usual) * 100.0;
+                long long estimated_total_ms = 0;
+                if (query_idx_usual > 0 && percent_done > 0.1) {
+                    estimated_total_ms = static_cast<long long>((elapsed_ms_usual / (percent_done / 100.0)));
+                }
+                std::cout << "\r  Usual MCS Search (" << m_str << "): Processed query " << std::setw(5) << query_idx_usual << "/" << total_queries_for_usual
+                    << " (" << std::fixed << std::setprecision(1) << percent_done << "%)"
+                    << ". Elapsed: " << elapsed_ms_usual / 1000.0 << "s."
+                    << (estimated_total_ms > 0 ? " Est. Total: " + std::to_string(estimated_total_ms / 1000.0) + "s." : "")
+                    << std::flush;
+            }
         }
+        std::cout << std::endl;
         auto timer_end_usual_search = std::chrono::high_resolution_clock::now();
-        auto duration_usual_search = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_usual_search - timer_start_usual_search);
-        total_times[usual_mcs_algo_name] = duration_mcs0_gen + duration_map_build + duration_usual_search; // Assuming these are defined earlier
-        total_matches_found[usual_mcs_algo_name] = current_total_matches;
-        std::cout << "     Usual MCS Search for " << m_str << " complete. Matches: " << current_total_matches
-            << " (Search Time: " << duration_usual_search.count() << " ms)"
-            << " (Total Time: " << total_times["Usual_MCS_" + m_str].count() << " ms)" << std::endl;
+        total_times_search["Usual_MCS_" + m_str] = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_usual_search - timer_start_usual_search);
+        total_matches_found["Usual_MCS_" + m_str] = current_usual_mcs_matches_count_total; // Update map
+        std::cout << "     Usual MCS Search for " << m_str << " complete. Matches: " << current_usual_mcs_matches_count_total
+            << " (Search Time: " << total_times_search["Usual_MCS_" + m_str].count() << " ms)" << std::endl;
 
-
-        // --- B. "Positional-Associated" MCS (for this M value) ---
+        // B. "Positional-Associated" MCS
         std::cout << "\nPART B: 'Positional-Associated' MCS sequence for " << m_str << std::endl;
         std::vector<Forms> positional_mcs_sequence_storage;
-        Forms mcs_0_for_pa = mcs_0_object; // Needs DEEP COPY if mcs_0_object is reused/modified
-        // Assuming Forms copy constructor handles deep copy
-        positional_mcs_sequence_storage.push_back(mcs_0_for_pa); // Add MCS_0
-        Forms current_patterns_to_reduce_holder = f_global_pattern_holder; // Deep copy, owns its Vars_Glob for this context
+        positional_mcs_sequence_storage.push_back(mcs_0_object); // MCS_0 is the first element (deep copy by vector)
 
         std::string pa_filename_prefix = "Pos_MCS_" + m_str;
-        // MCS_0 for PA is already saved as part of Usual MCS.
+        std::string current_input_patterns_file = "tavnits.txt"; // Initial patterns from global holder
+        int patterns_fed_to_current_phase1 = f_global_pattern_holder.NVars_Glob;
 
-        auto timer_start_pa_gen = std::chrono::high_resolution_clock::now();
-        const int MAX_POSITIONAL_SETS = N_PARAM_VAL; // Max possible refinement depth
-        Forms input_patterns_for_next_phase1 = f_global_pattern_holder; // Deep copy (or careful pointer share)
-
-        for (int pos_idx = 0; pos_idx < MAX_POSITIONAL_SETS - 1; ++pos_idx) { // Generate MCS_1 from MCS_0, etc.
+        auto timer_start_pa_gen_seq = std::chrono::high_resolution_clock::now();
+        for (int pos_idx = 0; pos_idx < N_PARAM_VAL - 1; ++pos_idx) { // Max N-1 refinements
             std::cout << "    Generating Positional MCS Set " << pos_idx + 1 << " for " << m_str << "..." << std::endl;
-            const Forms& mcs_i_ref = positional_mcs_sequence_storage.back(); // MCS_i
+            const Forms& mcs_i_ref = positional_mcs_sequence_storage.back();
 
-            Forms mcs_i_plus_1_candidate; // Will become MCS_{i+1}
-            // Setup candidate: copy params, copy filters from mcs_i_ref to start with
-            mcs_i_plus_1_candidate.N_glob = mcs_i_ref.N_glob;
-            mcs_i_plus_1_candidate.N_2_glob = mcs_i_ref.N_2_glob;
+            Forms mcs_i_plus_1_candidate;
+            mcs_i_plus_1_candidate.N_glob = N_PARAM_VAL; // Will be updated by Read_Patterns_FromFile inside perform_phase1
+            mcs_i_plus_1_candidate.N_2_glob = K_PARAM_VAL; // Context
             mcs_i_plus_1_candidate.Nsovp1_Glob = mcs_i_ref.Nsovp1_Glob;
-            mcs_i_plus_1_candidate.form1Size = mcs_i_ref.form1Size;
-            // Deep copy forms1Glob from mcs_i_ref
+            // mcs_i_plus_1_candidate.form1Size will be N_glob+1, N_glob from read patterns
+
+            // Deep copy filters from mcs_i_ref
             if (mcs_i_ref.Nform1_Glob > 0) {
+                mcs_i_plus_1_candidate.form1Size = mcs_i_ref.form1Size; // Important for allocation
                 mcs_i_plus_1_candidate.Nform1_Glob = mcs_i_ref.Nform1_Glob;
                 mcs_i_plus_1_candidate.forms1Glob = new int* [mcs_i_ref.Nform1_Glob];
                 for (int r = 0; r < mcs_i_ref.Nform1_Glob; ++r) {
@@ -390,239 +521,283 @@ int main() {
                         mcs_i_plus_1_candidate.forms1Glob[r][c] = mcs_i_ref.forms1Glob[r][c];
                     }
                 }
-            }
-            else {
-                mcs_i_plus_1_candidate.Nform1_Glob = 0;
-                mcs_i_plus_1_candidate.forms1Glob = nullptr;
-            }
+            } // else Nform1_Glob = 0, forms1Glob = nullptr
 
-            // Phase 1: Reduce basic patterns
-            // The 'input_patterns_for_next_phase1' object holds the patterns to be reduced.
-            // For pos_idx = 0, this is f_global_pattern_holder.
-            // For pos_idx > 0, this will be the reducedVars_Glob from the previous iteration,
-            // packaged into a Forms object.
-            std::string reduced_tavnits_filename = pa_filename_prefix + "_ReducedTavnits_Pos" + std::to_string(pos_idx + 1) + ".txt";
-            mcs_i_plus_1_candidate.perform_phase1_pattern_reduction(
-                mcs_i_ref, 
-                f_global_pattern_holder, 
-                reduced_tavnits_filename);
+            std::string output_reduced_patterns_filename = pa_filename_prefix + "_ReducedTavnits_Pos" + std::to_string(pos_idx + 1) + ".txt";
 
-            int n_reduced_vars_before_phase2 = mcs_i_plus_1_candidate.NReducedVars_Glob;
-            int n_filters_before_phase2 = mcs_i_plus_1_candidate.Nform1_Glob;
-
-            if (n_filters_before_phase2 == 0) { // No filters to refine from MCS_i
-                std::cout << "      Candidate MCS_" << pos_idx + 1 << " started with 0 filters. Stopping." << std::endl;
-                break;
+            if (patterns_fed_to_current_phase1 == 0 && mcs_i_plus_1_candidate.Nform1_Glob > 0) {
+                std::cout << "      Phase 1: No input patterns from file '" << current_input_patterns_file << "' to reduce, but filters exist. Stopping." << std::endl;
+                mcs_i_plus_1_candidate.clear_reducedVars_Glob(); // Ensure NReducedVars_Glob = 0
+                // Save empty file for consistency
+                std::ofstream empty_fout(output_reduced_patterns_filename);
+                if (empty_fout.is_open()) { empty_fout << "NReducedVars_Glob = 0" << std::endl; empty_fout.close(); }
             }
-            if (n_reduced_vars_before_phase2 == 0 && n_filters_before_phase2 > 0) {
-                std::cout << "      No basic patterns remained after Phase 1 reduction against MCS_" << pos_idx
-                    << ". Stopping positional generation for " << m_str << "." << std::endl;
-                break;
+            else if (patterns_fed_to_current_phase1 > 0 || mcs_i_plus_1_candidate.Nform1_Glob == 0) { // Proceed if patterns exist or no filters to refine anyway
+                mcs_i_plus_1_candidate.perform_phase1_pattern_reduction(mcs_i_ref, current_input_patterns_file, output_reduced_patterns_filename);
             }
 
 
-            // Phase 2: Iteratively prune filters
-            int refinement_prune_steps = 0;
-            if (n_filters_before_phase2 > 0) { // Only prune if there are filters
-                std::cout << "      Iteratively refining MCS_" << pos_idx + 1 << " (candidate filters: "
-                    << mcs_i_plus_1_candidate.Nform1_Glob
-                    << ", using " << mcs_i_plus_1_candidate.NReducedVars_Glob << " reduced patterns)" << std::endl;
-                while (mcs_i_plus_1_candidate.Nform1_Glob > 0 &&
-                    mcs_i_plus_1_candidate.perform_phase2_single_filter_prune_step(global_rng_engine)) {
-                    refinement_prune_steps++;
-                    // Safety break (optional, but good for debugging)
-                    // if (refinement_prune_steps > 2 * n_filters_before_phase2 && n_filters_before_phase2 > 0) {
-                    //     std::cerr << "      Warning: Excessive refinement iterations for MCS_" << pos_idx + 1 << ". Breaking." << std::endl;
-                    //     break;
-                    // }
+            int n_reduced_vars_this_step = mcs_i_plus_1_candidate.NReducedVars_Glob;
+            int n_filters_at_start_of_phase2 = mcs_i_plus_1_candidate.Nform1_Glob;
+
+            if (n_filters_at_start_of_phase2 == 0) { std::cout << "      MCS_" << pos_idx + 1 << " candidate has 0 filters before Phase 2. Stopping." << std::endl; break; }
+            if (n_reduced_vars_this_step == 0 && n_filters_at_start_of_phase2 > 0) {
+                std::cout << "      No patterns remained after Phase 1 for MCS_" << pos_idx + 1 << ". Stopping." << std::endl; break;
+            }
+
+            int prunes_in_phase2 = 0;
+            if (n_filters_at_start_of_phase2 > 0 && n_reduced_vars_this_step > 0) {
+                std::cout << "      Iteratively refining MCS_" << pos_idx + 1 << " (filters: " << n_filters_at_start_of_phase2
+                    << ", guiding patterns: " << n_reduced_vars_this_step << ")" << std::endl;
+                while (mcs_i_plus_1_candidate.Nform1_Glob > 0 && mcs_i_plus_1_candidate.perform_phase2_single_filter_prune_step(global_rng_engine)) {
+                    prunes_in_phase2++;
                 }
+                std::cout << "      Refinement for MCS_" << pos_idx + 1 << " complete (" << prunes_in_phase2 << " prunes). Final filters: " << mcs_i_plus_1_candidate.Nform1_Glob << std::endl;
+            }
+            else if (n_filters_at_start_of_phase2 > 0) {
+                std::cout << "      Skipping Phase 2 for MCS_" << pos_idx + 1 << " (no guiding patterns)." << std::endl;
             }
 
-            std::cout << "      Iteratively refining MCS_" << pos_idx + 1 << " (candidate filters: "
-                << mcs_i_plus_1_candidate.Nform1_Glob << ")" << std::endl;
-            while (mcs_i_plus_1_candidate.Nform1_Glob > 0 &&
-                mcs_i_plus_1_candidate.perform_phase2_single_filter_prune_step(global_rng_engine)) {
-                refinement_prune_steps++;
-                if (refinement_prune_steps > 2 * mcs_i_ref.Nform1_Glob && mcs_i_ref.Nform1_Glob > 0) { // Safety break
-                    std::cerr << "      Warning: Excessive refinement iterations for MCS_" << pos_idx + 1 << ". Breaking." << std::endl;
-                    break;
-                }
-            }
-            std::cout << "      Refinement for MCS_" << pos_idx + 1 << " complete (" << refinement_prune_steps << " prunes). Final filters: "
-                << mcs_i_plus_1_candidate.Nform1_Glob << std::endl;
+            if (mcs_i_plus_1_candidate.Nform1_Glob == 0) { std::cout << "      MCS_" << pos_idx + 1 << " became empty. Stopping." << std::endl; break; }
 
-            int n_filters_after_phase2 = mcs_i_plus_1_candidate.Nform1_Glob;
-            // Stop if:
-            // 1. No filters were pruned (n_filters_after_phase2 == n_filters_before_phase2)
-            // AND
-            // 2. The number of reduced patterns in this step is the same as the number of patterns input to this step's Phase 1
-            //    (mcs_i_plus_1_candidate.NReducedVars_Glob == input_patterns_for_next_phase1.NVars_Glob
-            //     OR if input_patterns_for_next_phase1 was holding its patterns in reducedVars_Glob, then check that)
-            // OR if the candidate MCS became empty.
-
-            bool no_filters_pruned = (refinement_prune_steps == 0);
-            // To check if patterns stopped reducing, compare NReducedVars_Glob of mcs_i_plus_1_candidate
-            // with the NVars_Glob (or NReducedVars_Glob if that's where they were held) of input_patterns_for_next_phase1.
-            // Let's assume input_patterns_for_next_phase1.Vars_Glob was used if it's the global set,
-            // and input_patterns_for_next_phase1.reducedVars_Glob if it was a previously reduced set.
-            // This gets a bit tricky with how `input_patterns_for_next_phase1` is structured.
-
-            // Let's use your stated conditions:
-            // 1. No filters removed in Phase 2 of this step.
-            // 2. No patterns removed in Phase 1 of this step (i.e., NReducedVars_Glob == count of patterns fed into Phase 1).
-
-            int patterns_fed_to_phase1_count;
-
-            if (pos_idx == 0) { // First iteration, used global patterns
-                patterns_fed_to_phase1_count = f_global_pattern_holder.NVars_Glob;
-            }
-            else {
-                // Subsequent iterations, used the reducedVars_Glob from the *previous* mcs_i_plus_1_candidate,
-                // which became input_patterns_for_next_phase1.
-                // This assumes input_patterns_for_next_phase1's relevant patterns are in its 'Vars_Glob' if we copy them there.
-                // Or, if perform_phase1_pattern_reduction can take patterns from either .Vars_Glob or .reducedVars_Glob of its source.
-                // Let's assume 'input_patterns_for_next_phase1' always has its relevant patterns in its '.Vars_Glob' member
-                // for simplicity of perform_phase1_pattern_reduction's current signature.
-                patterns_fed_to_phase1_count = input_patterns_for_next_phase1.NVars_Glob;
-            }
-            bool no_patterns_deleted_in_phase1 = (n_reduced_vars_before_phase2 == patterns_fed_to_phase1_count);
-
-            /*std::cout << "      Refinement for MCS_" << pos_idx + 1 << " complete (" << refinement_prune_steps << " prunes). Final filters: "
-                << mcs_i_plus_1_candidate.Nform1_Glob << std::endl;*/
-
-            if (mcs_i_plus_1_candidate.Nform1_Glob == 0) {
-                std::cout << "      MCS_" << pos_idx + 1 << " became empty after refinement. Stopping." << std::endl;
-                // Destructor of mcs_i_plus_1_candidate will clean its memory
-                break;
-            }
-
-            positional_mcs_sequence_storage.push_back(mcs_i_plus_1_candidate); // Adds a COPY
+            positional_mcs_sequence_storage.push_back(mcs_i_plus_1_candidate);
             mcs_i_plus_1_candidate.save_forms_to_file(pa_filename_prefix + "_Filters_Pos" + std::to_string(pos_idx + 1) + ".txt", "Positional MCS");
-            // --- Prepare for the NEXT iteration's Phase 1 input ---
-            // The reducedVars_Glob from the *current* mcs_i_plus_1_candidate (now stored in the sequence)
-            // becomes the set of patterns to be further reduced in the *next* iteration.
-            // We need to transfer these into a Forms object that `perform_phase1_pattern_reduction` can read as a source.
-            // Let's make `input_patterns_for_next_phase1` take these.
-            // This requires `input_patterns_for_next_phase1` to clear its old patterns and take new ones.
 
-            // Clear previous content of input_patterns_for_next_phase1 (if it was a deep copy holder)
-            // (Its destructor will handle its own members if it goes out of scope and is re-created,
-            // or we manage it explicitly)
+            bool no_filters_pruned_this_step = (prunes_in_phase2 == 0);
+            bool no_patterns_deleted_this_phase1 = (n_reduced_vars_this_step == patterns_fed_to_current_phase1);
 
-            // Create a new Forms object to hold the reduced patterns that will be the input for the next iteration.
-            Forms next_input_patterns;
-            next_input_patterns.N_glob = positional_mcs_sequence_storage.back().N_glob; // N of the patterns
-            next_input_patterns.N_2_glob = positional_mcs_sequence_storage.back().N_2_glob; // K context
-            next_input_patterns.NVars_Glob = positional_mcs_sequence_storage.back().NReducedVars_Glob; // Count of patterns
+            current_input_patterns_file = output_reduced_patterns_filename; // Output of this phase 1 is input for next
+            patterns_fed_to_current_phase1 = n_reduced_vars_this_step;
 
-            if (next_input_patterns.NVars_Glob > 0) {
-                next_input_patterns.Vars_Glob = new bool* [next_input_patterns.NVars_Glob];
-                for (int k = 0; k < next_input_patterns.NVars_Glob; ++k) {
-                    next_input_patterns.Vars_Glob[k] = new bool[next_input_patterns.N_glob];
-                    for (int l = 0; l < next_input_patterns.N_glob; ++l) {
-                        // Copy from the reducedVars_Glob of the *just added* MCS set
-                        next_input_patterns.Vars_Glob[k][l] = positional_mcs_sequence_storage.back().reducedVars_Glob[k][l];
-                    }
-                }
+            if (no_filters_pruned_this_step && no_patterns_deleted_this_phase1 && patterns_fed_to_current_phase1 > 0) { // check patterns_fed > 0
+                std::cout << "      Stabilized at Positional Set " << pos_idx + 1 << ". Stopping." << std::endl; break;
             }
-            else {
-                next_input_patterns.Vars_Glob = nullptr;
+            if (patterns_fed_to_current_phase1 == 0 && positional_mcs_sequence_storage.back().Nform1_Glob > 0) { // Check last added MCS
+                std::cout << "      Stopping: No patterns to guide further refinement, but filters exist in MCS_" << pos_idx + 1 << "." << std::endl; break;
             }
-            input_patterns_for_next_phase1 = next_input_patterns; // Assignment operator (deep copy)
-
-
-            // New stopping condition check
-            if (pos_idx > 0) { // Don't check for stopping on the very first generated MCS_1
-                if (no_filters_pruned && no_patterns_deleted_in_phase1) {
-                    std::cout << "      Stabilized: No filters pruned in this step AND no patterns deleted in Phase 1 of this step." << std::endl;
-                    std::cout << "      Stopping positional generation for " << m_str << "." << std::endl;
-                    break;
-                }
-            }
-        } // End of pos_idx loop
-        
-        auto timer_end_pa_gen = std::chrono::high_resolution_clock::now();
-        auto duration_pa_gen = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_pa_gen - timer_start_pa_gen);
+        }
+        auto timer_end_pa_gen_seq = std::chrono::high_resolution_clock::now();
+        auto duration_pa_gen_seq = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_pa_gen_seq - timer_start_pa_gen_seq);
         std::cout << "    Positional MCS sequence generation for " << m_str << " complete. Generated "
             << positional_mcs_sequence_storage.size() << " sets (including MCS_0)."
-            << " (Time: " << duration_pa_gen.count() << " ms)" << std::endl;
-
+            << " (Time: " << duration_pa_gen_seq.count() << " ms)" << std::endl;
+        total_times_preprocess["Pos_MCS_" + m_str] = duration_base_patterns + duration_mcs0_gen + duration_map_build + duration_pa_gen_seq;
 
         std::cout << "  3. Searching with Positional MCS (" << m_str << ")..." << std::endl;
-        long long total_pos_mcs_matches_count = 0;
-        // The filter map for PA search is the one built from MCS_0 (usual_mcs_filter_map)
-        auto timer_start_pa_search = std::chrono::high_resolution_clock::now();
-        for (const auto& q_str : queries) {
-            total_pos_mcs_matches_count += search_positional_mcs(q_str, positional_mcs_sequence_storage, usual_mcs_filter_map, main_text).size();
+        long long current_pos_mcs_matches_count_total = 0; // Renamed
+        std::string pos_mcs_matches_filename = "positional_mcs_matches_" + m_str + ".txt";
+        // Clear file and write header
+        std::ofstream pos_outfile(pos_mcs_matches_filename, std::ios_base::trunc);
+        if (pos_outfile.is_open()) {
+            pos_outfile << "QueryID\tNumMatches\tMatchPosition_1\tMatchPosition_2\t..." << std::endl;
+            pos_outfile.close();
         }
-        auto timer_end_pa_search = std::chrono::high_resolution_clock::now();
-        auto duration_pa_search = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_pa_search - timer_start_pa_search);
-        // Total time for PA includes MCS_0 gen + PA sequence gen + map build (same as usual) + PA search
-        total_times["Pos_MCS_" + m_str] = duration_mcs0_gen + duration_pa_gen + duration_map_build + duration_pa_search;
-        total_matches_found["Pos_MCS_" + m_str] = total_pos_mcs_matches_count;
-        std::cout << "     Positional MCS Search for " << m_str << " complete. Matches: " << total_pos_mcs_matches_count
-            << " (Search Time: " << duration_pa_search.count() << " ms)"
-            << " (Total Time: " << total_times["Pos_MCS_" + m_str].count() << " ms)" << std::endl;
+        else {
+            std::cerr << "ERROR: Could not open " << pos_mcs_matches_filename << " to write header for M=" << m_val << std::endl;
+        }
 
-        // mcs_0_object destructor will be called here
-        // positional_mcs_sequence_storage destructor will call destructor for each Forms object
+        auto timer_start_pa_search = std::chrono::high_resolution_clock::now();
+        int query_idx_pos = 0;
+		// Progress indicator block for Positional MCS
+        const int total_queries_for_pos = queries.size();
+        const int pos_progress_interval = std::max(1, total_queries_for_pos / 100);
+        for (const auto& q_str : queries) {
+            std::set<int> current_query_matches = search_positional_mcs(q_str, positional_mcs_sequence_storage, usual_mcs_filter_map, main_text, N_PARAM_VAL, MATCH_SIMILARITY_THRESHOLD);
+            current_pos_mcs_matches_count_total += current_query_matches.size();
+
+            save_match_positions(pos_mcs_matches_filename, "Query_" + std::to_string(query_idx_pos), current_query_matches);
+            query_idx_pos++;
+            // Progress indicator block for Positional MCS
+            if (query_idx_pos % pos_progress_interval == 0 || query_idx_pos == total_queries_for_pos) {
+                auto current_time_pos = std::chrono::high_resolution_clock::now();
+                auto elapsed_ms_pos = std::chrono::duration_cast<std::chrono::milliseconds>(current_time_pos - timer_start_pa_search).count();
+                double percent_done = (static_cast<double>(query_idx_pos) / total_queries_for_pos) * 100.0;
+                long long estimated_total_ms = 0;
+                if (query_idx_pos > 0 && percent_done > 0.1) {
+                    estimated_total_ms = static_cast<long long>((elapsed_ms_pos / (percent_done / 100.0)));
+                }
+                std::cout << "\r  Positional MCS Search (" << m_str << "): Processed query " << std::setw(5) << query_idx_pos << "/" << total_queries_for_pos
+                    << " (" << std::fixed << std::setprecision(1) << percent_done << "%)"
+                    << ". Elapsed: " << elapsed_ms_pos / 1000.0 << "s."
+                    << (estimated_total_ms > 0 ? " Est. Total: " + std::to_string(estimated_total_ms / 1000.0) + "s." : "")
+                    << std::flush;
+            }
+        }
+		std::cout << std::endl; // Newline after the progress indicator finishes
+        auto timer_end_pa_search = std::chrono::high_resolution_clock::now();
+        total_times_search["Pos_MCS_" + m_str] = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_pa_search - timer_start_pa_search);
+        total_matches_found["Pos_MCS_" + m_str] = current_pos_mcs_matches_count_total; // Update map
+        std::cout << "     Positional MCS Search for " << m_str << " complete. Matches: " << current_pos_mcs_matches_count_total
+            << " (Search Time: " << total_times_search["Pos_MCS_" + m_str].count() << " ms)" << std::endl;
     } // End of M-value loop
 
+    // Naive Search
+    std::cout << "\nPART C: Naive Search Algorithm..." << std::endl;
+    long long current_naive_matches_count_total = 0; // Renamed to avoid conflict
+    std::string naive_matches_filename = "naive_matches_details.txt";
+    // Clear file and write header
+    std::ofstream naive_outfile(naive_matches_filename, std::ios_base::trunc);
+    if (naive_outfile.is_open()) {
+        naive_outfile << "QueryID\tNumMatches\tMatchPosition_1\tMatchPosition_2\t..." << std::endl;
+        naive_outfile.close(); // Close after writing header
+    }
+    else {
+        std::cerr << "ERROR: Could not open " << naive_matches_filename << " to write header." << std::endl;
+        // Potentially stop or handle error
+    }
 
-    // --- Naive Search (Run Once) ---
-    std::cout << "\nRunning Naive Search Algorithm..." << std::endl;
-    long long total_naive_matches_count = 0;
     auto timer_start_naive_search = std::chrono::high_resolution_clock::now();
+    int query_idx_naive = 0;
+    const int total_queries_for_naive = queries.size();
+    const int naive_progress_interval = std::max(1, total_queries_for_naive / 100);
+
     for (const auto& q_str : queries) {
-        total_naive_matches_count += search_naive(q_str, main_text).size();
+        std::set<int> current_query_matches = search_naive(q_str, main_text, N_PARAM_VAL, MATCH_SIMILARITY_THRESHOLD);
+        current_naive_matches_count_total += current_query_matches.size();
+
+        // Save matches for this query
+        save_match_positions(naive_matches_filename, "Query_" + std::to_string(query_idx_naive), current_query_matches);
+
+        query_idx_naive++;
+        if (query_idx_naive % naive_progress_interval == 0 || query_idx_naive == total_queries_for_naive) {
+            auto current_time_naive = std::chrono::high_resolution_clock::now();
+            auto elapsed_ms_naive = std::chrono::duration_cast<std::chrono::milliseconds>(current_time_naive - timer_start_naive_search).count();
+            double percent_done = (static_cast<double>(query_idx_naive) / total_queries_for_naive) * 100.0;
+
+            long long estimated_total_ms = 0;
+            if (query_idx_naive > 0 && percent_done > 0.1) { // Avoid division by zero and unstable early estimates
+                estimated_total_ms = static_cast<long long>((elapsed_ms_naive / (percent_done / 100.0)));
+            }
+
+            std::cout << "\r  Naive Search: Processed query " << std::setw(5) << query_idx_naive << "/" << total_queries_for_naive
+                << " (" << std::fixed << std::setprecision(1) << percent_done << "%)"
+                << ". Elapsed: " << elapsed_ms_naive / 1000.0 << "s."
+                << (estimated_total_ms > 0 ? " Est. Total: " + std::to_string(estimated_total_ms / 1000.0) + "s." : "")
+                << std::flush;
+        }
     }
+    std::cout << std::endl; // Newline after the progress indicator finishes
+
     auto timer_end_naive_search = std::chrono::high_resolution_clock::now();
-    auto duration_naive_search = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_naive_search - timer_start_naive_search);
-    total_times["Naive"] = duration_naive_search;
-    total_matches_found["Naive"] = total_naive_matches_count;
-    std::cout << "  Naive Search complete. Matches: " << total_naive_matches_count
-        << " (Time: " << duration_naive_search.count() << " ms)" << std::endl;
+    total_times_search["Naive"] = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_naive_search - timer_start_naive_search);
+    total_matches_found["Naive"] = current_naive_matches_count_total; // Update map
+    std::cout << "  Naive Search complete. Total Matches: " << current_naive_matches_count_total
+        << " (Total Search Time: " << total_times_search["Naive"].count() << " ms)" << std::endl;
 
 
-    // --- Task 4 & 5: Compare Results & Theoretical Time ---
-    std::cout << "\n--- Final Results Summary ---" << std::endl;
-    std::cout << std::setw(25) << std::left << "Algorithm"
-        << std::setw(15) << std::right << "Total Matches"
-        << std::setw(15) << std::right << "Total Time (ms)" << std::endl;
-    std::cout << std::string(55, '-') << std::endl;
-
-    for (const auto& m_val : M_VALUES_PARAM) {
-        std::string m_str = "M" + std::to_string(m_val);
-        std::string usual_key = "Usual_MCS_" + m_str;
-        std::string pos_key = "Pos_MCS_" + m_str;
-        if (total_times.count(usual_key)) {
-            std::cout << std::setw(25) << std::left << usual_key
-                << std::setw(15) << std::right << total_matches_found[usual_key]
-                << std::setw(15) << std::right << total_times[usual_key].count() << std::endl;
-        }
-        if (total_times.count(pos_key)) {
-            std::cout << std::setw(25) << std::left << pos_key
-                << std::setw(15) << std::right << total_matches_found[pos_key]
-                << std::setw(15) << std::right << total_times[pos_key].count() << std::endl;
-        }
+    std::string conclusions_filename = "experiment_conclusions.txt";
+    std::ofstream conclusion_fout(conclusions_filename);
+    if (!conclusion_fout.is_open()) {
+        std::cerr << "ERROR: Could not open " << conclusions_filename << " to write conclusions." << std::endl;
     }
-    std::cout << std::setw(25) << std::left << "Naive"
-        << std::setw(15) << std::right << total_matches_found["Naive"]
-        << std::setw(15) << std::right << total_times["Naive"].count() << std::endl;
+    else {
+        std::cout << "\nWriting conclusions to " << conclusions_filename << "..." << std::endl;
+        conclusion_fout << "--- MCS Algorithm Comparison Experiment Conclusions ---" << std::endl;
+        conclusion_fout << "Parameters:" << std::endl;
+        conclusion_fout << "  X_PARAM: " << X_PARAM << std::endl;
+        conclusion_fout << "  N_PARAM_VAL (W - Query/Window Size): " << N_PARAM_VAL << std::endl;
+        conclusion_fout << "  K_PARAM_VAL (Min 1s in Base Patterns C(N,K)): " << K_PARAM_VAL << std::endl;
+        conclusion_fout << "  MATCH_SIMILARITY_THRESHOLD: " << MATCH_SIMILARITY_THRESHOLD * 100 << "%" << std::endl;
+        conclusion_fout << "  M_VALUES_PARAM (1s in Filters): {";
+        for (size_t i = 0; i < M_VALUES_PARAM.size(); ++i) {
+            conclusion_fout << M_VALUES_PARAM[i] << (i == M_VALUES_PARAM.size() - 1 ? "" : ", ");
+        }
+        conclusion_fout << "}" << std::endl;
+        conclusion_fout << "  TEXT_SIZE_PARAM: " << TEXT_SIZE_PARAM << std::endl;
+        conclusion_fout << "  NUM_QUERIES_PARAM: " << NUM_QUERIES_PARAM << std::endl;
+        conclusion_fout << "  ALPHABET_SIZE_Y_PARAM: " << ALPHABET_SIZE_Y_PARAM << std::endl;
+        conclusion_fout << "  Base patterns C(" << N_PARAM_VAL - 1 << "," << K_PARAM_VAL - 1 << ") generated: "
+            << f_global_pattern_holder.NVars_Glob << std::endl;
 
-    std::cout << "\nTheoretical Time Discussion:" << std::endl;
-    std::cout << "Naive: O(num_queries * text_length * W) = O("
-        << NUM_QUERIES_PARAM << " * " << TEXT_SIZE_PARAM << " * " << N_PARAM_VAL << ")" << std::endl;
-    std::cout << "MCS-based methods are more complex:" << std::endl;
-    std::cout << "  - Base Pattern Gen (create_mas1): Depends on C(N,K) or 2^N iteration." << std::endl;
-    std::cout << "  - MCS_0 Gen (chetv_struct): O(NVars_Glob * N_glob * avg_mcs_size_check_complexity)." << std::endl;
-    std::cout << "  - Map Build: O(TEXT_SIZE_PARAM * num_filters_in_mcs0 * filter_span_avg)." << std::endl;
-    std::cout << "  - Search: O(num_queries * num_filters_in_mcs_set * filter_application + num_candidates * W)." << std::endl;
-    std::cout << "  - Positional MCS Gen: Adds O(MAX_POS_SETS * (NVars_Glob_reduction + Nform1_Glob_pruning_loop * NReducedVars * Nform1_Glob_candidate))." << std::endl;
-    std::cout << "Actual performance depends heavily on data, number of filters, and candidate hits." << std::endl;
+
+        conclusion_fout << "\n--- Performance Summary ---" << std::endl;
+        conclusion_fout << std::setw(25) << std::left << "Algorithm"
+            << std::setw(20) << std::right << "Preprocessing(ms)"
+            << std::setw(15) << std::right << "Search(ms)"
+            << std::setw(20) << std::right << "Total Matches" << std::endl;
+        conclusion_fout << std::string(80, '-') << std::endl;
+
+        for (const auto& m_val_loop : M_VALUES_PARAM) { // Use a different loop var name
+            std::string m_str_loop = "M" + std::to_string(m_val_loop);
+            std::string usual_key_loop = "Usual_MCS_" + m_str_loop;
+            std::string pos_key_loop = "Pos_MCS_" + m_str_loop;
+
+            if (total_times_search.count(usual_key_loop)) {
+                conclusion_fout << std::setw(25) << std::left << usual_key_loop
+                    << std::setw(20) << std::right << (total_times_preprocess.count(usual_key_loop) ? total_times_preprocess[usual_key_loop].count() : 0)
+                    << std::setw(15) << std::right << total_times_search[usual_key_loop].count()
+                    << std::setw(20) << std::right << total_matches_found[usual_key_loop] << std::endl;
+            }
+            if (total_times_search.count(pos_key_loop)) {
+                conclusion_fout << std::setw(25) << std::left << pos_key_loop
+                    << std::setw(20) << std::right << (total_times_preprocess.count(pos_key_loop) ? total_times_preprocess[pos_key_loop].count() : 0)
+                    << std::setw(15) << std::right << total_times_search[pos_key_loop].count()
+                    << std::setw(20) << std::right << total_matches_found[pos_key_loop] << std::endl;
+            }
+        }
+        conclusion_fout << std::setw(25) << std::left << "Naive"
+            << std::setw(20) << std::right << 0
+            << std::setw(15) << std::right << total_times_search["Naive"].count()
+            << std::setw(20) << std::right << total_matches_found["Naive"] << std::endl;
+
+        conclusion_fout << "\n--- Theoretical Time Complexity Discussion ---" << std::endl;
+        long long n_q = NUM_QUERIES_PARAM;
+        long long t_len = TEXT_SIZE_PARAM;
+        long long w_len = N_PARAM_VAL;
+        long long n_vars_glob = f_global_pattern_holder.NVars_Glob;
+
+        conclusion_fout << "Key: Q=NumQueries (" << n_q << "), T=TextLength (" << t_len
+            << "), W=QueryLength (" << w_len << "), N_base=NumBasePatterns (" << n_vars_glob << ")" << std::endl;
+        conclusion_fout << "     N_filters_M=NumFiltersForM, Span_avg=AvgFilterSpan, Hits_cand=CandidateHitsFromMap" << std::endl;
+
+        conclusion_fout << "\nNaive Search:" << std::endl;
+        conclusion_fout << "  Theory: O(Q * T * W)" << std::endl;
+        conclusion_fout << "  Values: O(" << n_q << " * " << t_len << " * " << w_len << ") = O("
+            << n_q * t_len * w_len << ")" << std::endl; // This product can be huge, might overflow std::to_string or be unreadable.
+        // Better to keep as factors or use scientific notation if very large.
+        // For now, let's print the factors.
+        conclusion_fout << "  Calculated: O(" << n_q << " * " << t_len << " * " << w_len << ")" << std::endl;
 
 
-    // f_global_pattern_holder destructor will be called, cleaning Vars_Glob
+        conclusion_fout << "\nMCS-based Methods (General Components):" << std::endl;
+        conclusion_fout << "  Base Pattern Gen (create_mas1): Using prev_permutation for C(W-1, K-1)" << std::endl;
+        conclusion_fout << "    Theory: Roughly O( (W-1) * C(W-1, K-1) ) if permutation is dominant." << std::endl;
+        // C(20,14) = 38760. 20 * 38760 = 775200. This is feasible.
+        conclusion_fout << "    Values: C(" << w_len - 1 << ", " << K_PARAM_VAL - 1 << ") = " << n_vars_glob
+            << ". Approx O(" << (w_len - 1) * n_vars_glob << ")" << std::endl;
+
+        conclusion_fout << "  MCS_0 Gen (chetv_struct_Generation) per M:" << std::endl;
+        conclusion_fout << "    Theory: O(N_base * W * AvgFilterStrSetInsert)" << std::endl;
+        conclusion_fout << "    Values: O(" << n_vars_glob << " * " << w_len << " * log(N_filters_M_avg))" << std::endl;
+
+        conclusion_fout << "  Forms1_anal1_Global_Refinement (if run) per M:" << std::endl;
+        conclusion_fout << "    Theory (Professor's version): Complex. Pass1 is O(N_base * N_filters_M * W * Span_avg). Pass2 is O(N_filters_M * N_base * N_filters_M_active * W * Span_avg)." << std::endl;
+        conclusion_fout << "    This is very intensive. N_filters_M_active also changes. Dominated by N_base * (N_filters_M)^2 * W * Span_avg roughly for Pass2." << std::endl;
+
+
+        conclusion_fout << "  Filter Map Building per M:" << std::endl;
+        conclusion_fout << "    Theory: O(T * N_filters_M * Span_avg * AvgMapInsert)" << std::endl;
+        conclusion_fout << "    Values: O(" << t_len << " * N_filters_M_avg * Span_avg_M * log(UniqueMaskedWords_M))" << std::endl;
+
+        conclusion_fout << "  Search (Usual MCS) per M:" << std::endl;
+        conclusion_fout << "    Theory: O(Q * (N_filters_M * W_filter_apply + Hits_cand_avg_M * W_similarity_check))" << std::endl;
+
+        conclusion_fout << "  Positional MCS Sequence Generation per M:" << std::endl;
+        conclusion_fout << "    Phase 1 (perform_phase1_pattern_reduction) per Positional Step:" << std::endl;
+        conclusion_fout << "      Theory: O(N_patterns_input_to_step * N_filters_MCS_i * Span_avg_MCS_i)" << std::endl;
+        conclusion_fout << "    Phase 2 (perform_phase2_single_filter_prune_step loop) per Positional Step:" << std::endl;
+        conclusion_fout << "      Theory: O(N_filters_candidate * N_reduced_patterns_this_step * N_glob_pattern * N_filters_candidate * AvgFilterSpan)"
+            << " (Rough, as it's iterative with random choices)" << std::endl;
+
+        conclusion_fout << "  Search (Positional MCS) per M:" << std::endl;
+        conclusion_fout << "    Theory: O(Q * Sum_over_Pos_Sets(N_filters_in_set * W_filter_apply) + Hits_cand_avg_M0 * W_similarity_check)" << std::endl;
+
+        conclusion_fout << "\nNote: N_filters_M, Span_avg, UniqueMaskedWords, Hits_cand are data-dependent and vary per M." << std::endl;
+        conclusion_fout << "The 'Values' section for MCS provides the symbolic formula with parameters; actual numbers would require per-M stats (e.g., actual N_filters for M3, M4, M5)." << std::endl;
+
+        conclusion_fout.close();
+        std::cout << "Conclusions saved to " << conclusions_filename << std::endl;
+    }
     std::cout << "\nAll processing complete." << std::endl;
     return 0;
 }
