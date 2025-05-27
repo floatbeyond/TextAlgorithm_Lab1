@@ -65,7 +65,7 @@ public:
 
     // Utility
     void save_forms_to_file(const std::string& filename, const std::string& comment_prefix) const;
-
+    std::string pattern_to_string(const bool* pattern, int length) const;
     void clear_reducedVars_Glob();
 
 private:

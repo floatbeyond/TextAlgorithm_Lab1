@@ -10,74 +10,149 @@
 #include <iomanip>   // For std::setw, std::flush
 
 // --- chetv_struct_Generation ---
+// Generates an MCS (Minimal Cover Set) of filters.
+// A basic_pattern is "covered" if any existing filter in the MCS is a SUBSTRING of the basic_pattern.
+// If not covered, a candidate_filter is derived (prefix of basic_pattern with M ones).
+// This candidate_filter is added to MCS if:
+//   1. It starts with '1'.
+//   2. It's not an exact duplicate of a filter already in MCS.
 void Forms::chetv_struct_Generation(const std::string& output_initial_forms_filename, const Forms& pattern_source) {
-    std::cout << "chetv_struct_Generation: Generating initial MCS (M=" << this->Nsovp1_Glob
-        << ") from " << pattern_source.NVars_Glob << " basic patterns..." << std::endl;
+	std::cout << "chetv_struct_Generation: Generating initial MCS (M=" << this->Nsovp1_Glob
+		<< ") from " << pattern_source.NVars_Glob << " basic patterns..." << std::endl;
 
-    if (pattern_source.Vars_Glob == nullptr || pattern_source.NVars_Glob == 0) {
-        std::cerr << "  ERROR (chetv_struct): No basic patterns (pattern_source.Vars_Glob) available." << std::endl;
-        this->Nform1_Glob = 0; this->forms1Glob = nullptr; return;
-    }
-    if (this->Nsovp1_Glob <= 0) {
-        std::cerr << "  ERROR (chetv_struct): Invalid M value (Nsovp1_Glob=" << this->Nsovp1_Glob << ")." << std::endl;
-        this->Nform1_Glob = 0; this->forms1Glob = nullptr; return;
-    }
+	if (pattern_source.Vars_Glob == nullptr || pattern_source.NVars_Glob == 0) {
+		std::cerr << "  ERROR (chetv_struct): No basic patterns (pattern_source.Vars_Glob) available." << std::endl;
+		this->Nform1_Glob = 0; this->forms1Glob = nullptr; return;
+	}
+	if (this->Nsovp1_Glob <= 0) { // M (target ones in candidate)
+		std::cerr << "  ERROR (chetv_struct): Invalid M value (Nsovp1_Glob=" << this->Nsovp1_Glob << ")." << std::endl;
+		this->Nform1_Glob = 0; this->forms1Glob = nullptr; return;
+	}
 
-    clear_forms1Glob();
-    this->form1Size = this->N_glob + 1; // N_glob of 'this' object, for filter storage
+	clear_forms1Glob(); // Clears this->forms1Glob and sets Nform1_Glob = 0
 
-    std::vector<int*> collected_filters_list;
-    std::set<std::string> unique_candidate_filter_strings;
-    int M = this->Nsovp1_Glob;
+	// this->N_glob is the N (max length) for filters stored in this Forms object.
+	// It must be set before calling this function (e.g., mcs_0_object.N_glob = N_PARAM_VAL; in main)
+	// form1Size is the allocation size for each filter array (N_glob + 1 for span storage)
+	this->form1Size = this->N_glob + 1;
 
-    for (int i = 0; i < pattern_source.NVars_Glob; ++i) {
-        const bool* current_basic_pattern = pattern_source.Vars_Glob[i];
-        std::string candidate_filter_str_derived = "";
-        int ones_in_candidate = 0;
-        int candidate_span = 0;
+	std::vector<int*> mcs_filters_data_list;           // Stores the actual int* filter data for the MCS
+	std::vector<std::string> mcs_filter_strings_for_coverage_check; // Stores string version of MCS filters for substring check
+	std::set<std::string> unique_mcs_candidate_strings_added; // To ensure we don't add duplicate *filter strings* to MCS
 
-        for (int bit_idx = 0; bit_idx < pattern_source.N_glob; ++bit_idx) { // Use pattern_source.N_glob for length
-            candidate_span++;
-            if (current_basic_pattern[bit_idx]) {
-                candidate_filter_str_derived += '1'; ones_in_candidate++;
-            }
-            else {
-                candidate_filter_str_derived += '0';
-            }
-            if (ones_in_candidate == M) break;
-        }
+	int M_target_ones = this->Nsovp1_Glob;
 
-        if (ones_in_candidate < M) continue;
+	for (int i = 0; i < pattern_source.NVars_Glob; ++i) {
+		const bool* current_basic_pattern_bool = pattern_source.Vars_Glob[i];
+		// Convert the current full basic pattern to a string for substring checks
+		// pattern_source.N_glob is the length of the input basic patterns
+		std::string current_basic_pattern_str = pattern_to_string(current_basic_pattern_bool, pattern_source.N_glob);
+		if (current_basic_pattern_str.empty()) continue; // Skip if conversion failed or pattern was empty
 
-        if (unique_candidate_filter_strings.find(candidate_filter_str_derived) == unique_candidate_filter_strings.end()) {
-            unique_candidate_filter_strings.insert(candidate_filter_str_derived);
-            int* new_filter_data = new int[this->form1Size]();
-            for (int bit_idx = 0; bit_idx < candidate_span; ++bit_idx) {
-                new_filter_data[bit_idx] = (candidate_filter_str_derived[bit_idx] == '1' ? 1 : 0);
-            }
-            new_filter_data[this->N_glob] = candidate_span; // Span stored using this->N_glob
-            collected_filters_list.push_back(new_filter_data);
-        }
-        if (i > 0 && i % 10000 == 0) {
-            std::cout << "\r    chetv_struct: Processed " << i << "/" << pattern_source.NVars_Glob
-                << " basic patterns. Current unique filters: " << collected_filters_list.size() << std::flush;
-        }
-    }
-    std::cout << "\r    chetv_struct: Processed " << pattern_source.NVars_Glob << "/" << pattern_source.NVars_Glob
-        << " basic patterns. Total unique filters generated: " << collected_filters_list.size() << std::endl;
+		// 1. Check if current_basic_pattern_str is covered by any existing filter in MCS
+		bool is_covered = false;
+		for (const std::string& mcs_filter_str : mcs_filter_strings_for_coverage_check) {
+			if (current_basic_pattern_str.find(mcs_filter_str) != std::string::npos) {
+				is_covered = true;
+				break;
+			}
+		}
 
-    this->Nform1_Glob = collected_filters_list.size();
-    if (this->Nform1_Glob > 0) {
-        this->forms1Glob = new int* [this->Nform1_Glob];
-        for (size_t j = 0; j < collected_filters_list.size(); ++j) {
-            this->forms1Glob[j] = collected_filters_list[j];
-        }
-    }
-    else {
-        this->forms1Glob = nullptr;
-    }
-    this->save_forms_to_file(output_initial_forms_filename, "Initial MCS_0 (chetv_struct)");
-    std::cout << "chetv_struct_Generation: Finished." << std::endl;
+		if (is_covered) {
+			if (i > 0 && i % 20000 == 0) { // Provide progress even for skipped items
+				std::cout << "\r    chetv_struct: Processed " << i + 1 << "/" << pattern_source.NVars_Glob
+					<< " basic patterns. Current MCS size: " << mcs_filters_data_list.size() << std::flush;
+			}
+			continue; // This pattern is covered, move to the next one
+		}
+
+		// 2. If not covered, derive a candidate filter from current_basic_pattern_bool
+		std::string candidate_filter_str_derived = "";
+		int ones_in_candidate = 0;
+		int candidate_span = 0;
+
+		// Derive candidate: prefix of current_basic_pattern_bool until M_target_ones '1's are found
+		// or end of pattern_source.N_glob is reached.
+		for (int bit_idx = 0; bit_idx < pattern_source.N_glob; ++bit_idx) {
+			candidate_span++;
+			char current_char = current_basic_pattern_bool[bit_idx] ? '1' : '0';
+			candidate_filter_str_derived += current_char;
+
+			if (current_basic_pattern_bool[bit_idx]) {
+				ones_in_candidate++;
+			}
+
+			if (ones_in_candidate == M_target_ones) break;
+		}
+
+		// Validate the derived candidate
+		if (ones_in_candidate < M_target_ones) continue; // Not enough ones to form a valid candidate
+
+		// Rule: Candidate filter MUST start with '1'
+		if (candidate_filter_str_derived.empty() || candidate_filter_str_derived[0] != '1') {
+			continue;
+		}
+
+		// Rule: Candidate filter span must be storable in this->N_glob for this Forms object
+		// this->N_glob refers to the N (max length) capacity for filters in THIS Forms object.
+		if (candidate_span > this->N_glob) {
+			std::cerr << "\n  CRITICAL (chetv_struct): Candidate filter span (" << candidate_span
+				<< ") from pattern_source (length " << pattern_source.N_glob
+				<< ") exceeds THIS object's filter storage N_glob (" << this->N_glob
+				<< "). This candidate cannot be stored. MCS generation might be incomplete or invalid." << std::endl;
+			// This scenario indicates a setup issue if pattern_source.N_glob > this->N_glob and M leads to long spans.
+			// For now, we skip this candidate. A fatal error might be an option depending on desired strictness.
+			// Consider `return;` after cleanup if this should halt MCS generation.
+			// Cleanup for early return:
+			// for(int* f_data : mcs_filters_data_list) { delete[] f_data; }
+			// return; // If choosing to halt.
+			continue; // Skip this un-storable candidate.
+		}
+
+
+		// 3. Check if this exact candidate_filter_str_derived is already in the MCS
+		if (unique_mcs_candidate_strings_added.count(candidate_filter_str_derived)) {
+			continue; // This specific candidate filter string is already in MCS, no need to add again
+		}
+
+		// 4. Add the new, unique, valid candidate filter to MCS
+		unique_mcs_candidate_strings_added.insert(candidate_filter_str_derived);
+		mcs_filter_strings_for_coverage_check.push_back(candidate_filter_str_derived);
+
+		// Convert to int* and store. Allocation uses this->form1Size (based on this->N_glob).
+		int* new_filter_data = new int[this->form1Size](); // Zero-initialized
+		for (int bit_idx = 0; bit_idx < candidate_span; ++bit_idx) {
+			new_filter_data[bit_idx] = (candidate_filter_str_derived[bit_idx] == '1' ? 1 : 0);
+		}
+		// Store the actual span of this filter at the reserved index this->N_glob
+		new_filter_data[this->N_glob] = candidate_span;
+		mcs_filters_data_list.push_back(new_filter_data);
+
+		if (i > 0 && i % 10000 == 0) { // Less frequent update for actual additions
+			std::cout << "\r    chetv_struct: Processed " << i + 1 << "/" << pattern_source.NVars_Glob
+				<< " basic patterns. Current MCS size: " << mcs_filters_data_list.size() << std::flush;
+		}
+	} // End loop over pattern_source.Vars_Glob
+
+	std::cout << "\r    chetv_struct: Processed " << pattern_source.NVars_Glob << "/" << pattern_source.NVars_Glob
+		<< " basic patterns. Final unique MCS filters generated: " << mcs_filters_data_list.size() << "      " << std::endl;
+
+	// Populate this->forms1Glob from mcs_filters_data_list
+	this->Nform1_Glob = mcs_filters_data_list.size();
+	if (this->Nform1_Glob > 0) {
+		this->forms1Glob = new int* [this->Nform1_Glob];
+		for (size_t j = 0; j < mcs_filters_data_list.size(); ++j) {
+			this->forms1Glob[j] = mcs_filters_data_list[j]; // Transfer ownership of int* arrays
+		}
+		// mcs_filters_data_list itself will be cleared when it goes out of scope,
+		// but it no longer owns the int* arrays.
+	}
+	else {
+		this->forms1Glob = nullptr; // Already set by clear_forms1Glob, but explicit is fine.
+	}
+
+	this->save_forms_to_file(output_initial_forms_filename, "Initial MCS_0 (chetv_struct)");
+	std::cout << "chetv_struct_Generation: Finished." << std::endl;
 }
 
 // --- save_forms_to_file ---

@@ -147,3 +147,14 @@ void Forms::create_mas1() {
     }
     std::cout << "create_mas1: Finished. Generated " << this->NVars_Glob << " basic patterns." << std::endl;
 }
+
+// --- Helper to convert bool* pattern to string ---
+std::string Forms::pattern_to_string(const bool* pattern, int length) const {
+    if (pattern == nullptr || length <= 0) return "";
+    std::string s = "";
+    s.reserve(length); // Pre-allocate memory
+    for (int i = 0; i < length; ++i) {
+        s += (pattern[i] ? '1' : '0');
+    }
+    return s;
+}
