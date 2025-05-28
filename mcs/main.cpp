@@ -299,67 +299,68 @@ std::set<int> search_usual_mcs(
 // For each filter in each MCS set, it applies the filter to the query,
 // looks up the masked query in a filter map (typically built from MCS_0),
 // and then verifies candidate positions. Matches from all sets are aggregated.
-std::set<int> search_positional_mcs(const std::string& query,                     // The query string
-    const std::vector<Forms>& positional_mcs_sequence, // Sequence of MCS sets
-    const FilterMapCollection& map_from_mcs0,       // Filter map, usually built from MCS_0
-    const std::string& text,                      // The text to search within
-    int W,                                       // Expected query/window length
-    double threshold)                             // Similarity threshold
+std::set<int> search_positional_mcs(
+        const std::string& query, // Length W
+        const std::vector<Forms>& positional_mcs_sequence, // MCS_0, MCS_1, ..., MCS_W-1 (potentially)
+        const FilterMapCollection& map_from_mcs0, // Or potentially multiple maps
+        const std::string& text,
+        int W,
+        double threshold)
 {
-    std::set<int> aggregated_match_positions; // Stores unique match positions from all MCS sets
+    std::set<int> candidate_text_positions_for_verification;
 
-    // Validate query length.
-    if (query.length() != static_cast<size_t>(W)) {
-        // std::cerr << "Warning (search_positional_mcs): Query length mismatch." << std::endl;
-        return aggregated_match_positions;
-    }
+    // For each possible starting position 'q_pos' of a sub-segment within the query
+    for (int q_pos = 0; q_pos < W; ++q_pos) {
+        if (q_pos >= positional_mcs_sequence.size()) continue; // No MCS set for this position
 
-    // Iterate through each MCS set in the positional sequence (MCS_0, MCS_1, etc.).
-    for (const Forms& mcs_set : positional_mcs_sequence) {
-        // --- STAGE 1 (per MCS set): Candidate Identification ---
-        // For each filter within the current mcs_set...
-        for (int i = 0; i < mcs_set.Nform1_Glob; ++i) {
-            const int* current_filter_bits = mcs_set.forms1Glob[i];
-            int filter_span = mcs_set.forms1Glob[i][mcs_set.N_glob]; // N_glob of this mcs_set
+        const Forms& mcs_for_this_q_pos = positional_mcs_sequence[q_pos]; // Get MCS_p
 
-            // Validate filter span against query length W.
-            if (filter_span <= 0 || filter_span > W) {
-                continue;
-            }
+        // For each filter in MCS_p
+        for (int filter_idx = 0; filter_idx < mcs_for_this_q_pos.Nform1_Glob; ++filter_idx) {
+            const int* filter_bits = mcs_for_this_q_pos.forms1Glob[filter_idx];
+            int filter_span = mcs_for_this_q_pos.forms1Glob[filter_idx][mcs_for_this_q_pos.N_glob];
 
-            // Apply the current filter to the query string.
-            // mcs_set.N_glob is passed as the filter storage length.
-            std::string masked_query = apply_forms_filter_to_string(query, current_filter_bits, filter_span, mcs_set.N_glob);
+            if (q_pos + filter_span > W) continue; // Filter extends beyond query if starting at q_pos
 
-            if (masked_query == "INVALID_FILTER_APPLICATION") {
-                continue;
-            }
+            // Extract the query segment starting at q_pos with length filter_span
+            std::string query_segment = query.substr(q_pos, filter_span);
 
-            // Look up the masked_query in the filter map (which was typically built from MCS_0).
-            // The assumption is that filters in subsequent positional sets (MCS_1, MCS_2...)
-            // are still meaningful when their masked versions are looked up in MCS_0's map.
-            auto it = map_from_mcs0.word_to_index_map.find(masked_query);
+            std::string masked_query_subsegment = apply_forms_filter_to_string(
+                query_segment,
+                filter_bits,
+                filter_span,
+                mcs_for_this_q_pos.N_glob
+            );
 
+            // Lookup in map_from_mcs0
+            auto it = map_from_mcs0.word_to_index_map.find(masked_query_subsegment);
             if (it != map_from_mcs0.word_to_index_map.end()) {
-                const std::vector<int>& occurrences = map_from_mcs0.entries_vector[it->second].occurrences;
+                const std::vector<int>& occurrences_in_text = map_from_mcs0.entries_vector[it->second].occurrences;
+                for (int text_start_of_masked_segment : occurrences_in_text) {
+                    // This is where the masked SUBSEGMENT (length filter_span) matched in text.
+                    // To find where the FULL query (length W) would start in text:
+                    // text_start_of_FULL_query = text_start_of_masked_segment - q_pos;
+                    long long potential_full_query_start_in_text_ll =
+                        static_cast<long long>(text_start_of_masked_segment) - q_pos;
 
-                // --- STAGE 2 (per MCS set): Candidate Verification ---
-                for (int text_pos : occurrences) {
-                    // Bounds check.
-                    if (static_cast<long long>(text_pos) + W > text.length()) {
-                        continue;
-                    }
-
-                    // Extract original text segment and verify against original query.
-                    std::string text_segment = text.substr(text_pos, W);
-                    if (calculate_similarity(query, text_segment) >= threshold) {
-                        aggregated_match_positions.insert(text_pos); // Add to set (handles uniqueness).
-                    }
+                    candidate_text_positions_for_verification.insert(static_cast<int>(potential_full_query_start_in_text_ll));
                 }
             }
         }
     }
-    return aggregated_match_positions; // Return all unique matches found across all positional MCS sets.
+
+    // Now, verify all unique candidate_text_positions_for_verification
+    std::set<int> final_match_positions;
+    for (int text_candidate_start : candidate_text_positions_for_verification) {
+        if (text_candidate_start < 0 || static_cast<long long>(text_candidate_start) + W > text.length()) {
+            continue;
+        }
+        std::string text_segment_to_verify = text.substr(text_candidate_start, W);
+        if (calculate_similarity(query, text_segment_to_verify) >= threshold) {
+            final_match_positions.insert(text_candidate_start);
+        }
+    }
+    return final_match_positions;
 }
 
 // --- NEW Helper Functions for file operations ---
@@ -526,13 +527,37 @@ int main() {
 
         auto timer_start_usual_search = std::chrono::high_resolution_clock::now();
         int query_idx_usual = 0;
+        const int total_queries_for_usual = queries.size();
+        const int usual_progress_interval = std::max(1, total_queries_for_usual / 100);
         for (const auto& q_str : queries) {
-            std::set<int> current_query_matches = search_usual_mcs(q_str, mcs_0_object, usual_mcs_filter_map, main_text, N_PARAM_VAL, MATCH_SIMILARITY_THRESHOLD);
+            std::set<int> current_query_matches = search_usual_mcs( // Call without progress params
+                q_str,
+                mcs_0_object,
+                usual_mcs_filter_map,
+                main_text,
+                N_PARAM_VAL,
+                MATCH_SIMILARITY_THRESHOLD
+            );
             current_usual_mcs_matches_count_total += current_query_matches.size();
-
             save_match_positions(usual_mcs_matches_filename, "Query_" + std::to_string(query_idx_usual), current_query_matches);
-            query_idx_usual++;
+
+            query_idx_usual++; // Increment after processing
+            if (query_idx_usual % usual_progress_interval == 0 || query_idx_usual == total_queries_for_usual) {
+                auto current_time_progress = std::chrono::high_resolution_clock::now();
+                auto elapsed_ms_progress = std::chrono::duration_cast<std::chrono::milliseconds>(current_time_progress - timer_start_usual_search).count();
+                double percent_done = (static_cast<double>(query_idx_usual) / total_queries_for_usual) * 100.0;
+                long long estimated_total_ms = 0;
+                if (query_idx_usual > 0 && percent_done > 0.1 && elapsed_ms_progress > 0) { // check elapsed_ms > 0
+                    estimated_total_ms = static_cast<long long>((elapsed_ms_progress / (percent_done / 100.0)));
+                }
+                std::cout << "\r    Usual MCS Search (" << m_str << "): Query " << std::setw(5) << query_idx_usual << "/" << total_queries_for_usual
+                    << " (" << std::fixed << std::setprecision(1) << percent_done << "%)"
+                    << ". Elapsed: " << elapsed_ms_progress / 1000.0 << "s."
+                    << (estimated_total_ms > 0 ? " Est. Total: " + std::to_string(estimated_total_ms / 1000.0) + "s." : "")
+                    << std::flush;
+            }
         }
+        if (total_queries_for_usual > 0) std::cout << std::endl; // Newline after progress is done
         auto timer_end_usual_search = std::chrono::high_resolution_clock::now();
         total_times_search["Usual_MCS_" + m_str] = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_usual_search - timer_start_usual_search);
         total_matches_found["Usual_MCS_" + m_str] = current_usual_mcs_matches_count_total; // Update map
@@ -542,89 +567,200 @@ int main() {
         // B. "Positional-Associated" MCS
         std::cout << "\nPART B: 'Positional-Associated' MCS sequence for " << m_str << std::endl;
         std::vector<Forms> positional_mcs_sequence_storage;
-        positional_mcs_sequence_storage.push_back(mcs_0_object); // MCS_0 is the first element (deep copy by vector)
+		Forms mcs_p_current_iter = mcs_0_object; // Deep copy
+        positional_mcs_sequence_storage.push_back(mcs_p_current_iter); // MCS_0 is the first element
+        Forms patterns_for_phase_A = f_global_pattern_holder; // Deep copy
 
         std::string pa_filename_prefix = "Pos_MCS_" + m_str;
-        std::string current_input_patterns_file = "tavnits.txt"; // Initial patterns from global holder
-        int patterns_fed_to_current_phase1 = f_global_pattern_holder.NVars_Glob;
+        //std::string current_input_patterns_file = "tavnits.txt"; // Initial patterns from global holder
+        //int patterns_fed_to_current_phase1 = f_global_pattern_holder.NVars_Glob;
 
         auto timer_start_pa_gen_seq = std::chrono::high_resolution_clock::now();
-        for (int pos_idx = 0; pos_idx < N_PARAM_VAL - 1; ++pos_idx) { // Max N-1 refinements
-            std::cout << "    Generating Positional MCS Set " << pos_idx + 1 << " for " << m_str << "..." << std::endl;
-            const Forms& mcs_i_ref = positional_mcs_sequence_storage.back();
+        //for (int pos_idx = 0; pos_idx < N_PARAM_VAL; ++pos_idx) { // Max N-1 refinements
+        //    std::cout << "    Generating Positional MCS Set " << pos_idx << " for " << m_str << "..." << std::endl;
+        //    const Forms& mcs_i_ref = positional_mcs_sequence_storage.back();
 
-            Forms mcs_i_plus_1_candidate;
-            mcs_i_plus_1_candidate.N_glob = N_PARAM_VAL; // Will be updated by Read_Patterns_FromFile inside perform_phase1
-            mcs_i_plus_1_candidate.N_2_glob = K_PARAM_VAL; // Context
-            mcs_i_plus_1_candidate.Nsovp1_Glob = mcs_i_ref.Nsovp1_Glob;
-            // mcs_i_plus_1_candidate.form1Size will be N_glob+1, N_glob from read patterns
+        //    Forms mcs_i_plus_1_candidate;
+        //    mcs_i_plus_1_candidate.N_glob = N_PARAM_VAL; // Will be updated by Read_Patterns_FromFile inside perform_phase1
+        //    mcs_i_plus_1_candidate.N_2_glob = K_PARAM_VAL; // Context
+        //    mcs_i_plus_1_candidate.Nsovp1_Glob = mcs_i_ref.Nsovp1_Glob;
+        //    // mcs_i_plus_1_candidate.form1Size will be N_glob+1, N_glob from read patterns
 
-            // Deep copy filters from mcs_i_ref
-            if (mcs_i_ref.Nform1_Glob > 0) {
-                mcs_i_plus_1_candidate.form1Size = mcs_i_ref.form1Size; // Important for allocation
-                mcs_i_plus_1_candidate.Nform1_Glob = mcs_i_ref.Nform1_Glob;
-                mcs_i_plus_1_candidate.forms1Glob = new int* [mcs_i_ref.Nform1_Glob];
-                for (int r = 0; r < mcs_i_ref.Nform1_Glob; ++r) {
-                    mcs_i_plus_1_candidate.forms1Glob[r] = new int[mcs_i_ref.form1Size];
-                    for (int c = 0; c < mcs_i_ref.form1Size; ++c) {
-                        mcs_i_plus_1_candidate.forms1Glob[r][c] = mcs_i_ref.forms1Glob[r][c];
-                    }
+        //    // Deep copy filters from mcs_i_ref
+        //    if (mcs_i_ref.Nform1_Glob > 0) {
+        //        mcs_i_plus_1_candidate.form1Size = mcs_i_ref.form1Size; // Important for allocation
+        //        mcs_i_plus_1_candidate.Nform1_Glob = mcs_i_ref.Nform1_Glob;
+        //        mcs_i_plus_1_candidate.forms1Glob = new int* [mcs_i_ref.Nform1_Glob];
+        //        for (int r = 0; r < mcs_i_ref.Nform1_Glob; ++r) {
+        //            mcs_i_plus_1_candidate.forms1Glob[r] = new int[mcs_i_ref.form1Size];
+        //            for (int c = 0; c < mcs_i_ref.form1Size; ++c) {
+        //                mcs_i_plus_1_candidate.forms1Glob[r][c] = mcs_i_ref.forms1Glob[r][c];
+        //            }
+        //        }
+        //    } // else Nform1_Glob = 0, forms1Glob = nullptr
+
+        //    std::string output_reduced_patterns_filename = pa_filename_prefix + "_ReducedTavnits_Pos" + std::to_string(pos_idx + 1) + ".txt";
+
+        //    if (patterns_fed_to_current_phase1 == 0 && mcs_i_plus_1_candidate.Nform1_Glob > 0) {
+        //        std::cout << "      Phase 1: No input patterns from file '" << current_input_patterns_file << "' to reduce, but filters exist. Stopping." << std::endl;
+        //        mcs_i_plus_1_candidate.clear_reducedVars_Glob(); // Ensure NReducedVars_Glob = 0
+        //        // Save empty file for consistency
+        //        std::ofstream empty_fout(output_reduced_patterns_filename);
+        //        if (empty_fout.is_open()) { empty_fout << "NReducedVars_Glob = 0" << std::endl; empty_fout.close(); }
+        //    }
+        //    else if (patterns_fed_to_current_phase1 > 0 || mcs_i_plus_1_candidate.Nform1_Glob == 0) { // Proceed if patterns exist or no filters to refine anyway
+        //        mcs_i_plus_1_candidate.perform_phase1_pattern_reduction(mcs_i_ref, current_input_patterns_file, output_reduced_patterns_filename);
+        //    }
+
+
+        //    int n_reduced_vars_this_step = mcs_i_plus_1_candidate.NReducedVars_Glob;
+        //    int n_filters_at_start_of_phase2 = mcs_i_plus_1_candidate.Nform1_Glob;
+
+        //    if (n_filters_at_start_of_phase2 == 0) { std::cout << "      MCS_" << pos_idx + 1 << " candidate has 0 filters before Phase 2. Stopping." << std::endl; break; }
+        //    if (n_reduced_vars_this_step == 0 && n_filters_at_start_of_phase2 > 0) {
+        //        std::cout << "      No patterns remained after Phase 1 for MCS_" << pos_idx + 1 << ". Stopping." << std::endl; break;
+        //    }
+
+        //    int prunes_in_phase2 = 0;
+        //    if (n_filters_at_start_of_phase2 > 0 && n_reduced_vars_this_step > 0) {
+        //        std::cout << "      Iteratively refining MCS_" << pos_idx + 1 << " (filters: " << n_filters_at_start_of_phase2
+        //            << ", guiding patterns: " << n_reduced_vars_this_step << ")" << std::endl;
+        //        while (mcs_i_plus_1_candidate.Nform1_Glob > 0 && mcs_i_plus_1_candidate.perform_phase2_single_filter_prune_step(global_rng_engine)) {
+        //            prunes_in_phase2++;
+        //        }
+        //        std::cout << "      Refinement for MCS_" << pos_idx + 1 << " complete (" << prunes_in_phase2 << " prunes). Final filters: " << mcs_i_plus_1_candidate.Nform1_Glob << std::endl;
+        //    }
+        //    else if (n_filters_at_start_of_phase2 > 0) {
+        //        std::cout << "      Skipping Phase 2 for MCS_" << pos_idx + 1 << " (no guiding patterns)." << std::endl;
+        //    }
+
+        //    if (mcs_i_plus_1_candidate.Nform1_Glob == 0) { std::cout << "      MCS_" << pos_idx + 1 << " became empty. Stopping." << std::endl; break; }
+
+        //    positional_mcs_sequence_storage.push_back(mcs_i_plus_1_candidate);
+        //    mcs_i_plus_1_candidate.save_forms_to_file(pa_filename_prefix + "_Filters_Pos" + std::to_string(pos_idx + 1) + ".txt", "Positional MCS");
+
+        //    bool no_filters_pruned_this_step = (prunes_in_phase2 == 0);
+        //    bool no_patterns_deleted_this_phase1 = (n_reduced_vars_this_step == patterns_fed_to_current_phase1);
+
+        //    current_input_patterns_file = output_reduced_patterns_filename; // Output of this phase 1 is input for next
+        //    patterns_fed_to_current_phase1 = n_reduced_vars_this_step;
+
+        //    if (no_filters_pruned_this_step && no_patterns_deleted_this_phase1 && patterns_fed_to_current_phase1 > 0) { // check patterns_fed > 0
+        //        std::cout << "      Stabilized at Positional Set " << pos_idx + 1 << ". Stopping." << std::endl; break;
+        //    }
+        //    if (patterns_fed_to_current_phase1 == 0 && positional_mcs_sequence_storage.back().Nform1_Glob > 0) { // Check last added MCS
+        //        std::cout << "      Stopping: No patterns to guide further refinement, but filters exist in MCS_" << pos_idx + 1 << "." << std::endl; break;
+        //    }
+        //}
+
+        for (int p = 0; p < N_PARAM_VAL; ++p) { // Iterate through positions p = 0, 1, ..., N-1
+            std::cout << "\n  --- Processing Positional Iteration for position p = " << p << " (M=" << m_val << ") ---" << std::endl;
+
+            // If p > 0, mcs_p_current_iter needs to be the MCS from the previous iteration (MCS_p-1)
+            // If p == 0, mcs_p_current_iter is already initial mcs_0_object copy.
+            if (p > 0) {
+                if (!positional_mcs_sequence_storage.empty()) { // Should not be empty if p > 0
+                    mcs_p_current_iter = positional_mcs_sequence_storage.back(); // Get refined MCS_p-1
                 }
-            } // else Nform1_Glob = 0, forms1Glob = nullptr
-
-            std::string output_reduced_patterns_filename = pa_filename_prefix + "_ReducedTavnits_Pos" + std::to_string(pos_idx + 1) + ".txt";
-
-            if (patterns_fed_to_current_phase1 == 0 && mcs_i_plus_1_candidate.Nform1_Glob > 0) {
-                std::cout << "      Phase 1: No input patterns from file '" << current_input_patterns_file << "' to reduce, but filters exist. Stopping." << std::endl;
-                mcs_i_plus_1_candidate.clear_reducedVars_Glob(); // Ensure NReducedVars_Glob = 0
-                // Save empty file for consistency
-                std::ofstream empty_fout(output_reduced_patterns_filename);
-                if (empty_fout.is_open()) { empty_fout << "NReducedVars_Glob = 0" << std::endl; empty_fout.close(); }
-            }
-            else if (patterns_fed_to_current_phase1 > 0 || mcs_i_plus_1_candidate.Nform1_Glob == 0) { // Proceed if patterns exist or no filters to refine anyway
-                mcs_i_plus_1_candidate.perform_phase1_pattern_reduction(mcs_i_ref, current_input_patterns_file, output_reduced_patterns_filename);
-            }
-
-
-            int n_reduced_vars_this_step = mcs_i_plus_1_candidate.NReducedVars_Glob;
-            int n_filters_at_start_of_phase2 = mcs_i_plus_1_candidate.Nform1_Glob;
-
-            if (n_filters_at_start_of_phase2 == 0) { std::cout << "      MCS_" << pos_idx + 1 << " candidate has 0 filters before Phase 2. Stopping." << std::endl; break; }
-            if (n_reduced_vars_this_step == 0 && n_filters_at_start_of_phase2 > 0) {
-                std::cout << "      No patterns remained after Phase 1 for MCS_" << pos_idx + 1 << ". Stopping." << std::endl; break;
-            }
-
-            int prunes_in_phase2 = 0;
-            if (n_filters_at_start_of_phase2 > 0 && n_reduced_vars_this_step > 0) {
-                std::cout << "      Iteratively refining MCS_" << pos_idx + 1 << " (filters: " << n_filters_at_start_of_phase2
-                    << ", guiding patterns: " << n_reduced_vars_this_step << ")" << std::endl;
-                while (mcs_i_plus_1_candidate.Nform1_Glob > 0 && mcs_i_plus_1_candidate.perform_phase2_single_filter_prune_step(global_rng_engine)) {
-                    prunes_in_phase2++;
+                else {
+                    std::cerr << "  ERROR: Positional sequence storage is unexpectedly empty for p > 0." << std::endl;
+                    break;
                 }
-                std::cout << "      Refinement for MCS_" << pos_idx + 1 << " complete (" << prunes_in_phase2 << " prunes). Final filters: " << mcs_i_plus_1_candidate.Nform1_Glob << std::endl;
-            }
-            else if (n_filters_at_start_of_phase2 > 0) {
-                std::cout << "      Skipping Phase 2 for MCS_" << pos_idx + 1 << " (no guiding patterns)." << std::endl;
             }
 
-            if (mcs_i_plus_1_candidate.Nform1_Glob == 0) { std::cout << "      MCS_" << pos_idx + 1 << " became empty. Stopping." << std::endl; break; }
+            Forms patterns_remaining_after_A_for_next_p;
+            patterns_remaining_after_A_for_next_p.N_glob = N_PARAM_VAL;
 
-            positional_mcs_sequence_storage.push_back(mcs_i_plus_1_candidate);
-            mcs_i_plus_1_candidate.save_forms_to_file(pa_filename_prefix + "_Filters_Pos" + std::to_string(pos_idx + 1) + ".txt", "Positional MCS");
+            // This block's purpose is to define patterns_for_phase_A for the *next* iteration (p+1).
+            // It should use the *just refined* mcs_p_current_iter (i.e., MCS_p)
+            // and the patterns that flowed into this iteration (patterns_for_phase_A, which is P_p).
+            // So, Phase B (refinement of mcs_p_current_iter) should happen *before* this.
 
-            bool no_filters_pruned_this_step = (prunes_in_phase2 == 0);
-            bool no_patterns_deleted_this_phase1 = (n_reduced_vars_this_step == patterns_fed_to_current_phase1);
+            // --- Let's re-order to follow the logic: Refine MCS_p, then use refined MCS_p to find P_p+1 ---
 
-            current_input_patterns_file = output_reduced_patterns_filename; // Output of this phase 1 is input for next
-            patterns_fed_to_current_phase1 = n_reduced_vars_this_step;
+            // --- Phase B equivalent (Image's Stage 2.1, 2.2-2.4): Refine mcs_p_current_iter to become final MCS_p ---
+            Forms problem_patterns_for_mcs_p_refinement;
+            problem_patterns_for_mcs_p_refinement.N_glob = f_global_pattern_holder.N_glob;
+            problem_patterns_for_mcs_p_refinement.N_2_glob = f_global_pattern_holder.N_2_glob;
 
-            if (no_filters_pruned_this_step && no_patterns_deleted_this_phase1 && patterns_fed_to_current_phase1 > 0) { // check patterns_fed > 0
-                std::cout << "      Stabilized at Positional Set " << pos_idx + 1 << ". Stopping." << std::endl; break;
+            std::cout << "    1. Identifying 'problem patterns' for refining MCS candidate for p=" << p << ":" << std::endl;
+            perform_positional_pattern_pruning_phase_a(
+                mcs_p_current_iter,                          // Current MCS_p candidate
+                0,                                           // "Starts with" check (prefix at index 0 of global patterns)
+                f_global_pattern_holder,                     // Source: All original global patterns
+                problem_patterns_for_mcs_p_refinement      // Output: Global patterns NOT prefixed by any filter in mcs_p_current_iter
+            );
+            std::cout << "      Found " << problem_patterns_for_mcs_p_refinement.NVars_Glob
+                << " problem patterns for refining current MCS candidate (p=" << p << ")." << std::endl;
+
+            std::cout << "    2. Refining MCS candidate for p=" << p << " (current filters: " << mcs_p_current_iter.Nform1_Glob
+                << ") using its " << problem_patterns_for_mcs_p_refinement.NVars_Glob << " problem patterns." << std::endl;
+
+            if (problem_patterns_for_mcs_p_refinement.NVars_Glob > 0 || mcs_p_current_iter.Nform1_Glob == 0) {
+                // Only refine if there are problem patterns OR if the MCS is currently empty (e.g. if it was cleared)
+                // This allows an empty MCS to potentially gain filters if problem_patterns is not empty.
+                // Or, if MCS has filters but problem_patterns is empty, it means it already prefix-covers all global.
+                // The refinement then ensures it's minimal for that.
+                mcs_p_current_iter.refine_mcs_iteratively_phase_b(
+                    problem_patterns_for_mcs_p_refinement.NVars_Glob > 0 ? problem_patterns_for_mcs_p_refinement : f_global_pattern_holder,
+                    // If no specific problem patterns, refine against global to ensure general minimality.
+                    // Or, strictly follow image: if problem_patterns is empty, refinement might not do much or be skipped.
+                    // Let's stick to: if problem_patterns is empty, refine against global for now.
+                    // A better logic might be: if problem_patterns empty AND mcs_p_current_iter is not empty, then it's already "good".
+                    global_rng_engine
+                );
             }
-            if (patterns_fed_to_current_phase1 == 0 && positional_mcs_sequence_storage.back().Nform1_Glob > 0) { // Check last added MCS
-                std::cout << "      Stopping: No patterns to guide further refinement, but filters exist in MCS_" << pos_idx + 1 << "." << std::endl; break;
+            else { // No problem patterns AND mcs_p_current_iter already has filters -> it prefix-covers all global.
+                std::cout << "      MCS candidate for p=" << p << " already prefix-covers all global patterns. "
+                    << "Performing global minimality check." << std::endl;
+                mcs_p_current_iter.refine_mcs_iteratively_phase_b(f_global_pattern_holder, global_rng_engine);
             }
-        }
+            std::cout << "      MCS for p=" << p << " refined. Final filters: " << mcs_p_current_iter.Nform1_Glob << std::endl;
+
+            // Store/Update the *refined* MCS_p in the sequence
+            if (p == 0) {
+                positional_mcs_sequence_storage[0] = mcs_p_current_iter; // Update refined MCS_0
+            }
+            else {
+                positional_mcs_sequence_storage.push_back(mcs_p_current_iter); // Add refined MCS_p
+            }
+            if (mcs_p_current_iter.Nform1_Glob > 0) {
+                mcs_p_current_iter.save_forms_to_file(pa_filename_prefix + "_Filters_Pos" + std::to_string(p) + ".txt",
+                    "Refined Positional MCS at p=" + std::to_string(p));
+            }
+
+            // --- Phase A equivalent (Our old "Phase A" - Prepare P_p+1 for the *next* iteration's loop) ---
+            // This uses the *just refined* mcs_p_current_iter (which is final MCS_p)
+            // and patterns_for_phase_A (which is P_p, the patterns that flowed into this p iteration)
+            // to determine P_p+1 (patterns_remaining_after_A_for_next_p).
+            if (p < N_PARAM_VAL - 1) { // No need to prepare patterns if this is the last p
+                std::cout << "    3. Pruning 'flowing patterns' (P_" << p << ", count: " << patterns_for_phase_A.NVars_Glob
+                    << ") using refined MCS_" << p << " (filters: " << mcs_p_current_iter.Nform1_Glob
+                    << ") at index " << p << " to get P_" << p + 1 << "." << std::endl;
+
+                perform_positional_pattern_pruning_phase_a(
+                    mcs_p_current_iter,                          // The refined MCS_p
+                    p,                                           // Current position index p for this pruning
+                    patterns_for_phase_A,                        // P_p (patterns that flowed into this iteration)
+                    patterns_remaining_after_A_for_next_p      // Output: P_p+1
+                );
+                patterns_for_phase_A = patterns_remaining_after_A_for_next_p; // Update for next iteration's input
+                std::cout << "      Patterns flowing to p=" << p + 1 << " (P_" << p + 1 << "): "
+                    << patterns_for_phase_A.NVars_Glob << std::endl;
+            }
+
+            // --- Check for termination conditions ---
+            if (mcs_p_current_iter.Nform1_Glob == 0) {
+                std::cout << "    MCS for position p=" << p << " became empty. Stopping Positional MCS generation." << std::endl;
+                break;
+            }
+            if (p < N_PARAM_VAL - 1 && patterns_for_phase_A.NVars_Glob == 0) {
+                std::cout << "    No patterns flowing to p=" << p + 1
+                    << ". Stopping Positional MCS generation." << std::endl;
+                break;
+            }
+        } // End of p loop
+
         auto timer_end_pa_gen_seq = std::chrono::high_resolution_clock::now();
         auto duration_pa_gen_seq = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_pa_gen_seq - timer_start_pa_gen_seq);
         std::cout << "    Positional MCS sequence generation for " << m_str << " complete. Generated "
@@ -647,13 +783,39 @@ int main() {
 
         auto timer_start_pa_search = std::chrono::high_resolution_clock::now();
         int query_idx_pos = 0;
+        const int total_queries_for_pos = queries.size();
+        const int pos_progress_interval = std::max(1, total_queries_for_pos / 100);
         for (const auto& q_str : queries) {
-            std::set<int> current_query_matches = search_positional_mcs(q_str, positional_mcs_sequence_storage, usual_mcs_filter_map, main_text, N_PARAM_VAL, MATCH_SIMILARITY_THRESHOLD);
+            // Assuming search_positional_mcs is your "advanced" version
+            std::set<int> current_query_matches = search_positional_mcs( // Call without progress params
+                q_str,
+                positional_mcs_sequence_storage,
+                usual_mcs_filter_map, // Still using map from MCS_0 for this example
+                main_text,
+                N_PARAM_VAL,
+                MATCH_SIMILARITY_THRESHOLD
+            );
             current_pos_mcs_matches_count_total += current_query_matches.size();
-
             save_match_positions(pos_mcs_matches_filename, "Query_" + std::to_string(query_idx_pos), current_query_matches);
-            query_idx_pos++;
+
+            query_idx_pos++; // Increment after processing
+            if (query_idx_pos % pos_progress_interval == 0 || query_idx_pos == total_queries_for_pos) {
+                auto current_time_progress = std::chrono::high_resolution_clock::now();
+                auto elapsed_ms_progress = std::chrono::duration_cast<std::chrono::milliseconds>(current_time_progress - timer_start_pa_search).count();
+                double percent_done = (static_cast<double>(query_idx_pos) / total_queries_for_pos) * 100.0;
+                long long estimated_total_ms = 0;
+                if (query_idx_pos > 0 && percent_done > 0.1 && elapsed_ms_progress > 0) { // check elapsed_ms > 0
+                    estimated_total_ms = static_cast<long long>((elapsed_ms_progress / (percent_done / 100.0)));
+                }
+                std::cout << "\r    Positional MCS Search (" << m_str << "): Query " << std::setw(5) << query_idx_pos << "/" << total_queries_for_pos
+                    << " (" << std::fixed << std::setprecision(1) << percent_done << "%)"
+                    << ". Elapsed: " << elapsed_ms_progress / 1000.0 << "s."
+                    << (estimated_total_ms > 0 ? " Est. Total: " + std::to_string(estimated_total_ms / 1000.0) + "s." : "")
+                    << std::flush;
+            }
         }
+        if (total_queries_for_pos > 0) std::cout << std::endl; // Newline after progress is done
+
         auto timer_end_pa_search = std::chrono::high_resolution_clock::now();
         total_times_search["Pos_MCS_" + m_str] = std::chrono::duration_cast<std::chrono::milliseconds>(timer_end_pa_search - timer_start_pa_search);
         total_matches_found["Pos_MCS_" + m_str] = current_pos_mcs_matches_count_total; // Update map

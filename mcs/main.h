@@ -62,17 +62,19 @@ public:
     // from forms_positional_logic.cpp
     void perform_phase1_pattern_reduction(const Forms& mcs_i_ref, const std::string& input_patterns_filename, const std::string& output_reduced_patterns_filename);
     bool perform_phase2_single_filter_prune_step(std::mt19937& rng_engine);
+    void refine_mcs_iteratively_phase_b(const Forms& global_pattern_source, std::mt19937& rng_engine);
+
 
     // Utility
     void save_forms_to_file(const std::string& filename, const std::string& comment_prefix) const;
     std::string pattern_to_string(const bool* pattern, int length) const;
     void clear_reducedVars_Glob();
+    void clear_Vars_Glob();
+
 
 private:
     void clear_all_memory();
     void deep_copy_members(const Forms& other);
-
-    void clear_Vars_Glob();
     void clear_forms1Glob();
     void clear_VarsDescr_Glob();
     // Add clear methods for NForms_pos_Glob, forms1_pos_Glob, SeqPos if they are dynamic
@@ -80,5 +82,12 @@ private:
     // Helper for perform_phase1_pattern_reduction if reading from file internally
     bool Read_Patterns_FromFile(const std::string& filename, bool**& out_vars, int& out_nvars, int& out_n_val, int& out_k_val);
 };
+
+void perform_positional_pattern_pruning_phase_a(
+    const Forms& mcs_for_pruning,
+    int position_index_p,
+    const Forms& input_patterns_source, // Contains Vars_Glob to be pruned
+    Forms& out_remaining_patterns_forms // Output: Vars_Glob populated with remaining
+);
 
 #endif // MAIN_H_SDF
